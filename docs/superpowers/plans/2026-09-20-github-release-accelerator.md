@@ -908,7 +908,7 @@ export function splitChunk(chunk: Chunk, minChunkSize: number = MIN_CHUNK_SIZE):
 cd "D:/github_download++" && npx vitest run tests/planner.test.ts
 ```
 
-预期：10 passed。
+预期：11 passed（`plan` 组 6 个 + `splitChunk` 组 5 个）。
 
 - [ ] **Step 5: 提交**
 
@@ -1281,7 +1281,7 @@ export class MirrorPool {
 cd "D:/github_download++" && npx vitest run tests/mirrors.test.ts
 ```
 
-预期：10 passed。
+预期：9 passed（`KNOWN_MIRRORS` 组 3 个 + `MirrorPool` 组 6 个）。
 
 - [ ] **Step 5: 提交**
 
