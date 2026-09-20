@@ -1916,7 +1916,9 @@ async function fetchChunk(
     const { done, value } = await reader.read();
     if (done) break;
     if (value && value.byteLength > 0) {
-      // 串行 await 写入，且读完即写即弃——不累积，内存与文件大小无关。
+      // 本 worker 内串行 await（同一块内至多一个写入在途），且读完即写即弃——
+      // 不累积，故内存与文件大小无关。跨 worker 的并发写是安全的：FSA 内部对写入
+      // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
       await sink.write(pos, value);
       pos += value.byteLength;
       onBytes(value.byteLength);
