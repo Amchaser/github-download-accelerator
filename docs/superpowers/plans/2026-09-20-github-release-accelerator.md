@@ -346,9 +346,15 @@ document.getElementById('go').onclick = async () => {
 
 `file://` 不是可靠的安全上下文，必须走 localhost：
 
-```bash
-cd "D:/github_download++/spike" && python -m http.server 8000
+```powershell
+cd "D:\github_download++\spike"
+python -m http.server 8000
 ```
+
+> **用两行，不要写成 `cd ... && python ...`。** 本机交互式 shell 是 **PowerShell 5.1**，
+> `&&` 在 PowerShell 7 之前不是合法的语句分隔符，会直接报
+> 「标记"&&"不是此版本中的有效语句分隔符」。Windows 上给用户的操作命令一律按
+> PowerShell 语法写（或拆成多行），不要用 bash 的 `&&` 连接。
 
 浏览器打开 `http://localhost:8000/fsa-parallel.html`。
 
