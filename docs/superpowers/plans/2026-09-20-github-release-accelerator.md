@@ -1497,6 +1497,15 @@ export const PROBE_BYTES = 512 * 1024;
 
 export const PROBE_TIMEOUT_MS = 3000;
 
+/**
+ * 极快的响应可能使测量耗时恰为 0（计时器分辨率有限，mock 环境下尤其常见）。
+ * **这不是失败**：探针只用于粗略排序，给一个有限的大值即可——绝不能因此把最快的
+ * 镜像判为 `ok: false`，Task 9 会据此排序并挑 best，那等于把最好的镜像排除掉。
+ * 用 `performance.now()`（微秒级）替代 `Date.now()`（毫秒级）以降低触发概率，
+ * 但仍必须夹住下界，不能依赖计时器恰好非零。
+ */
+const MIN_ELAPSED_SEC = 1e-6;
+
 async function probeOne(
   url: string,
   mirror: Mirror,
@@ -1505,28 +1514,29 @@ async function probeOne(
 ): Promise<ProbeResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const t0 = Date.now();
+  const t0 = performance.now();
   try {
     const res = await fetchFn(mirror.prefix + url, {
       headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
       signal: controller.signal,
     });
+    const ttfbMs = performance.now() - t0;
     if (res.status !== 206) {
-      return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+      return { mirror, ok: false, bytesPerSec: 0, ttfbMs };
     }
     const buf = await res.arrayBuffer();
-    const elapsed = (Date.now() - t0) / 1000;
-    if (buf.byteLength === 0 || elapsed <= 0) {
-      return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+    if (buf.byteLength === 0) {
+      return { mirror, ok: false, bytesPerSec: 0, ttfbMs };
     }
+    const elapsedSec = (performance.now() - t0) / 1000;
     return {
       mirror,
       ok: true,
-      bytesPerSec: buf.byteLength / elapsed,
-      ttfbMs: Date.now() - t0,
+      bytesPerSec: buf.byteLength / Math.max(elapsedSec, MIN_ELAPSED_SEC),
+      ttfbMs,
     };
   } catch {
-    return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+    return { mirror, ok: false, bytesPerSec: 0, ttfbMs: performance.now() - t0 };
   } finally {
     clearTimeout(timer);
   }
