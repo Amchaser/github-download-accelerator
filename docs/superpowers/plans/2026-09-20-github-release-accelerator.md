@@ -581,12 +581,45 @@ cd "D:/github_download++" && git add spike/fsa-parallel.html && git commit -m "s
 
 **Interfaces:**
 - Consumes: 无
-- Produces: 可运行的 `npm test` / `npm run dev` / `npm run build`；`src/types.ts` 中的 `Chunk`、`Mirror`、`Sink`、`ProbeResult` 类型
+- Produces: 可运行的 `npm test` 与 `npm run typecheck`；`src/types.ts` 中的 `Chunk`、`Mirror`、`Sink`、`ProbeResult`、`ReleaseRef`、`AssetMeta` 类型
+  （`npm run dev` / `npm run build` 本任务**尚不可用**：Vite 默认构建入口是 `index.html`，
+  而本任务禁止创建它。这两条要到 Task 9 建立 `index.html` 之后才生效。）
 
-- [ ] **Step 1: 初始化并安装依赖**
+- [ ] **Step 1: 手写 `package.json` 并安装依赖**
+
+**不要用 `npm init -y`，它会失败。** npm 从目录名推导包名，而本仓库目录名
+`github_download++` 含 `+`（非法字符），直接报 `npm error Invalid name: "github_download++"`，
+且不可重试。（这与「GitHub 仓库名不能用 `+`」是同一个约束——当初已因此把仓库命名为
+`github-download-accelerator`，但 npm 这一侧会撞上同一堵墙。）
+
+直接写 `package.json`：
+
+```json
+{
+  "name": "github-download-accelerator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+- **`"type": "module"` 是必需的**：本项目配置与源码都是 ESM。不设它，Vite 加载
+  `vite.config.ts` 时会警告「ESM 语法被按 CommonJS 处理」（`configLoader: 'native'`），
+  而其未来主版本会把 ESM 设为默认，届时直接报错。本项目 npm script 全是
+  `vite` / `tsc` 等外部命令，没有项目内的 `.js` 脚本，故设 ESM 无副作用。
+- 不写 `"main"`：`npm init` 默认的 `index.js` 并不存在，对 Vite 应用无意义。
+- `"private": true`：防止误发布到 npm。
+
+然后安装依赖（两行写，PowerShell 与 bash 通用）：
 
 ```bash
-cd "D:/github_download++" && npm init -y && npm i -D typescript vite vitest @types/node
+cd "D:/github_download++"
+npm i -D typescript vite vitest @types/node
 ```
 
 - [ ] **Step 2: 写配置文件**
