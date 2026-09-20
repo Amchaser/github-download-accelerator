@@ -1817,6 +1817,66 @@ describe('download', () => {
     // 2 个镜像 × 每个最多重试 3 次 = 6，允许拆分带来的额外调用但不该失控
     expect(calls).toBeLessThanOrEqual(24);
   });
+
+  it('分块长时间收不到数据时按空闲超时中断，不会永久挂起', async () => {
+    // 一个永不吐数据的流：只有空闲计时能抓到（墙钟设得很长，以排除另一道防线）。
+    // fake fetch 必须遵守 signal —— 真实 fetch 在 abort 时会让 body 报错，这里照实模拟，
+    // 否则 abort 无法打断一个本地构造的 ReadableStream，测试会永久挂起。
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      const body = new ReadableStream({
+        start(c) { signal?.addEventListener('abort', () => c.error(new Error('aborted'))); },
+      });
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': 'bytes 0-1023/1024' },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(1024);
+    await expect(
+      download({
+        url: URL_, total: 1024, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+        reqIdleTimeoutMs: 20, chunkDeadlineMs: 60_000, maxAttemptsPerChunk: 1,
+      }),
+    ).rejects.toThrow(/空闲超时/);
+    expect(sink.aborted).toBe(true);
+  });
+
+  it('滴水式慢流由墙钟死线中断——空闲超时抓不到（数据一直在来）', async () => {
+    // 每 1ms 吐 1 字节且永远吐不完：空闲计时被不断重置，故空闲超时（设 60s）永不触发，
+    // 只有墙钟死线（设 30ms）能中断。**这正是实测中把下载无限期拖住的形态**——
+    // 两次 500MB 实测都停在 98.x%，日志无错、字节数仍在极慢增长。
+    // 用 setTimeout 而非同步 enqueue，是为了让出宏任务，使计时器有机会触发。
+    let abortedFlag = false;
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      const body = new ReadableStream({
+        pull(c) {
+          setTimeout(() => {
+            if (signal?.aborted) { c.error(new Error('aborted')); return; }
+            try { c.enqueue(new Uint8Array(1)); } catch (e) { /* 流已关闭 */ }
+          }, 1);
+        },
+      });
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': 'bytes 0-1023/1024' },
+      });
+    }) as unknown as typeof fetch;
+    // 用丢弃式 sink：本用例只关心超时行为，不关心落盘内容，也避免越界写入干扰。
+    const sink: Sink = {
+      async write() { /* 丢弃 */ },
+      async close() {},
+      async abort() { abortedFlag = true; },
+    };
+    await expect(
+      download({
+        url: URL_, total: 1024, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+        reqIdleTimeoutMs: 60_000, chunkDeadlineMs: 30, maxAttemptsPerChunk: 1,
+      }),
+    ).rejects.toThrow(/墙钟死线/);
+    expect(abortedFlag).toBe(true);
+  });
 });
 
 describe('ChunkError', () => {
@@ -1852,6 +1912,21 @@ export const MAX_SAME_MIRROR_RETRIES = 3;
 /** 退避基数（毫秒）。第 n 次重试等待 BASE * 2^n。 */
 export const BACKOFF_BASE_MS = 200;
 
+/**
+ * 单个请求的「空闲」超时（毫秒）：只要还在出数据就不算超时。
+ * 抓的是**完全停住**的流。
+ */
+export const REQ_IDLE_TIMEOUT_MS = 30_000;
+
+/**
+ * 单个分块的「墙钟」死线（毫秒）：从发起到完成的总时长上限，与是否有数据无关。
+ * **空闲超时抓不到滴水式限速**——那种流每几秒吐几个字节，会不断重置空闲计时；
+ * 只有按墙钟计时的死线能中断它。此条有实测依据：两次 500MB 实测都停在 98.x%，
+ * 日志无任何错误、字节数仍在极慢增长，正是这个形态把下载无限期拖住。
+ * 两者**都要**：只有空闲超时抓不到滴水，只有墙钟会误杀慢但一直有数据的镜像。
+ */
+export const CHUNK_DEADLINE_MS = 90_000;
+
 export class ChunkError extends Error {
   constructor(message: string, readonly retryable: boolean) {
     super(message);
@@ -1871,6 +1946,10 @@ export interface DownloadOptions {
   maxAttemptsPerChunk?: number;
   /** 403 拆分降级的块大小下限，默认 MIN_CHUNK_SIZE。测试用小值驱动拆分逻辑。 */
   minChunkSize?: number;
+  /** 单请求空闲超时，默认 REQ_IDLE_TIMEOUT_MS。测试用极小值驱动超时逻辑。 */
+  reqIdleTimeoutMs?: number;
+  /** 单分块墙钟死线，默认 CHUNK_DEADLINE_MS。测试用极小值驱动。 */
+  chunkDeadlineMs?: number;
 }
 
 /** 队列暂空但仍有块未完成时，worker 的轮询间隔。 */
@@ -1890,54 +1969,94 @@ async function fetchChunk(
   fetchFn: typeof fetch,
   sink: Sink,
   onBytes: (n: number) => void,
+  idleTimeoutMs: number,
+  chunkDeadlineMs: number,
 ): Promise<void> {
-  let res: Response;
+  const label = `镜像 ${mirror.prefix} 区块 bytes=${chunk.start}-${chunk.end}`;
+
+  // 两道计时同时存在，缺一不可：
+  //   - 空闲超时：每次读取前重新计时，抓「完全停住」的流；
+  //   - 墙钟死线：整块一次计时、永不重置，抓「滴水式限速」——那种流每几秒吐几个字节，
+  //     会把空闲计时不断重置，只有按墙钟计时的死线能中断它（有实测依据，见常量注释）。
+  // 两者都经 AbortController 中断请求。**先触发的那道决定标签**（`if (!fired)`）：
+  // 否则墙钟触发后循环继续、空闲计时会覆盖标签，把「滴水」误报成「停住」。
+  const ac = new AbortController();
+  let fired: '空闲超时' | '墙钟死线' | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { if (!fired) fired = '空闲超时'; ac.abort(); }, idleTimeoutMs);
+  };
+  const deadlineTimer = setTimeout(() => { if (!fired) fired = '墙钟死线'; ac.abort(); }, chunkDeadlineMs);
+
   try {
-    res = await fetchFn(mirror.prefix + url, {
-      headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
-    });
-  } catch (e) {
-    throw new ChunkError(`网络错误: ${(e as Error).message}`, true);
-  }
-
-  if (res.status === 403) {
-    throw new ChunkError(`HTTP 403（疑似大 Range 被拒）`, true);
-  }
-  if (res.status === 200) {
-    throw new ChunkError(
-      `HTTP 200：上游忽略了 Range 请求，无法分块下载`,
-      false,
-    );
-  }
-  if (res.status !== 206) {
-    throw new ChunkError(`HTTP ${res.status}`, res.status >= 500);
-  }
-
-  const cr = res.headers.get('content-range');
-  const expectPrefix = `bytes ${chunk.start}-${chunk.end}/`;
-  if (!cr || !cr.startsWith(expectPrefix)) {
-    throw new ChunkError(`Content-Range 不符：期望前缀 "${expectPrefix}"，收到 "${cr}"`, true);
-  }
-
-  if (!res.body) throw new ChunkError('响应没有 body', true);
-
-  const reader = res.body.getReader();
-  let pos = chunk.start;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value && value.byteLength > 0) {
-      // 本 worker 内串行 await（同一块内至多一个写入在途），且读完即写即弃——
-      // 不累积，故内存与文件大小无关。跨 worker 的并发写是安全的：FSA 内部对写入
-      // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
-      await sink.write(pos, value);
-      pos += value.byteLength;
-      onBytes(value.byteLength);
+    armIdle();
+    let res: Response;
+    try {
+      res = await fetchFn(mirror.prefix + url, {
+        headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+        signal: ac.signal,
+      });
+    } catch (e) {
+      if (fired) {
+        throw new ChunkError(`${label} ${fired}：请求未完成（空闲 ${idleTimeoutMs / 1000}s / 墙钟 ${chunkDeadlineMs / 1000}s）`, true);
+      }
+      throw new ChunkError(`${label} 网络错误: ${(e as Error).message}`, true);
     }
-  }
 
-  if (pos !== chunk.end + 1) {
-    throw new ChunkError(`字节数不足：期望 ${chunk.end + 1 - chunk.start} 字节，实收 ${pos - chunk.start} 字节`, true);
+    if (res.status === 403) {
+      throw new ChunkError(`${label} HTTP 403（疑似大 Range 被拒）`, true);
+    }
+    if (res.status === 200) {
+      throw new ChunkError(
+        `${label} HTTP 200：上游忽略了 Range 请求，无法分块下载`,
+        false,
+      );
+    }
+    if (res.status !== 206) {
+      throw new ChunkError(`${label} HTTP ${res.status}`, res.status >= 500);
+    }
+
+    const cr = res.headers.get('content-range');
+    const expectPrefix = `bytes ${chunk.start}-${chunk.end}/`;
+    if (!cr || !cr.startsWith(expectPrefix)) {
+      throw new ChunkError(`${label} Content-Range 不符：期望前缀 "${expectPrefix}"，收到 "${cr}"`, true);
+    }
+
+    if (!res.body) throw new ChunkError(`${label} 响应没有 body`, true);
+
+    const reader = res.body.getReader();
+    let pos = chunk.start;
+    for (;;) {
+      armIdle();
+      let r;
+      try {
+        r = await reader.read();
+      } catch (e) {
+        if (fired) {
+          throw new ChunkError(`${label} ${fired}（已读到 ${pos}）：疑似该镜像滴水式限速或卡住，换镜像重试`, true);
+        }
+        throw new ChunkError(`${label} 流中断: ${(e as Error).message}`, true);
+      }
+      if (r.done) break;
+      // 写入期间停掉空闲计时：一次慢写入不该被误标成「镜像流超时」，它由墙钟死线兜住。
+      clearTimeout(idleTimer);
+      if (r.value && r.value.byteLength > 0) {
+        // 本 worker 内串行 await（同一块内至多一个写入在途），且读完即写即弃——
+        // 不累积，故内存与文件大小无关。跨 worker 的并发写是安全的：FSA 内部对写入
+        // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
+        await sink.write(pos, r.value);
+        pos += r.value.byteLength;
+        onBytes(r.value.byteLength);
+      }
+    }
+
+    if (pos !== chunk.end + 1) {
+      throw new ChunkError(`${label} 字节数不足：期望 ${chunk.end + 1 - chunk.start} 字节，实收 ${pos - chunk.start} 字节`, true);
+    }
+  } finally {
+    clearTimeout(idleTimer);
+    clearTimeout(deadlineTimer);
   }
 }
 
@@ -1957,6 +2076,8 @@ export async function download(opts: DownloadOptions): Promise<void> {
     onProgress,
     maxAttemptsPerChunk = 5,
     minChunkSize,
+    reqIdleTimeoutMs = REQ_IDLE_TIMEOUT_MS,
+    chunkDeadlineMs = CHUNK_DEADLINE_MS,
   } = opts;
 
   let bytesDone = 0;
@@ -1987,7 +2108,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
       }
 
       try {
-        await fetchChunk(mirror, url, job.chunk, fetchFn, sink, onBytes);
+        await fetchChunk(mirror, url, job.chunk, fetchFn, sink, onBytes, reqIdleTimeoutMs, chunkDeadlineMs);
         outstanding--;
       } catch (e) {
         const err = e instanceof ChunkError ? e : new ChunkError(String(e), true);
@@ -2042,7 +2163,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
 cd "D:/github_download++" && npx vitest run tests/engine.test.ts
 ```
 
-预期：16 passed。
+预期：18 passed（原 16 条 + 两条超时归因用例：空闲超时、墙钟死线）。
 
 - [ ] **Step 5: 提交**
 
@@ -2323,7 +2444,7 @@ export function renderMirrors(results: ProbeResult[]): void {
       (r) =>
         `<tr><td>${r.mirror.id}</td><td>${r.ok ? '可用' : '<span class="err">不可用</span>'}</td>` +
         `<td class="num">${r.ok ? `${fmtBytes(r.bytesPerSec)}/s` : '—'}</td>` +
-        `<td class="num">${r.ttfbMs} ms</td></tr>`,
+        `<td class="num">${r.ttfbMs.toFixed(1)} ms</td></tr>`,
     )
     .join('');
   els.mirrors.innerHTML =
