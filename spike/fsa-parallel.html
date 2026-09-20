@@ -6,11 +6,30 @@
 <button id="go">开始</button>
 <pre id="log"></pre>
 <script>
-const URL_ = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
+// 预设。?preset=quick 用一个小文件 + 小块大小，几秒钟就能跑完整轮并比对哈希——
+// 「定位写入是否正确」与文件大小无关，没必要用 500MB 去撞镜像的滴水限速。
+const PRESETS = {
+  full: {
+    url: 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe',
+    chunk: 8 * 1024 * 1024,
+    workers: 4,
+  },
+  quick: {
+    url: 'https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip',
+    chunk: 128 * 1024,   // 2 MB 文件 / 128 KB = 16 块，仍能跑出真正的 4 路并行
+    workers: 4,
+  },
+};
+const PRESET_NAME = new URLSearchParams(location.search).get('preset') || 'full';
+const PRESET = PRESETS[PRESET_NAME] || PRESETS.full;
+const URL_ = PRESET.url;
 const MIRRORS = ['https://gh.xmly.dev/', 'https://gh.xxooo.cf/', 'https://gh.ddlc.top/', 'https://gh.monlor.com/'];
-const CHUNK = 8 * 1024 * 1024;
-const WORKERS = 4;              // 并发 worker 数（= 占用前几个镜像）。可改成 1 做并发归因，见日志面板说明。
-const REQ_TIMEOUT_MS = 30000;   // 单请求超时，镜像挂住时必须响亮失败而不是静默停住
+const CHUNK = PRESET.chunk;
+const WORKERS = PRESET.workers;
+const REQ_TIMEOUT_MS = 30000;   // 单请求「空闲」超时：只要还在出数据就不重新计时
+const CHUNK_DEADLINE_MS = 90000; // 单分块「墙钟」死线。滴水式限速每几秒吐一个字节，
+                                 // 能同时骗过空闲超时和进度看门狗（两者都只看「有没有动」），
+                                 // 只有按墙钟计时的死线抓得到。实测中正是这个形态把下载无限期拖住。
 const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
 
 const HAS_MEM = typeof performance !== 'undefined' && !!performance.memory;
@@ -58,6 +77,8 @@ function logFailureAttribution(msg) {
 document.getElementById('go').onclick = async () => {
   // 先在运行最开始、无条件地交代度量口径与归因方法，
   // 这样无论后面是成功还是失败，读日志的人都知道该怎么读这些数字。
+  log(`预设 = ${PRESET_NAME}（改 URL 加 ?preset=quick 可跑小文件快速验证）`);
+  log(`目标 = ${URL_}`);
   log(`WORKERS = ${WORKERS}（并发 worker 数；镜像白名单共 ${MIRRORS.length} 个）`);
   log(`镜像: ${MIRRORS.join(' , ')}`);
   log(`块大小 = ${CHUNK / 1048576} MiB，单请求超时 = ${REQ_TIMEOUT_MS / 1000}s`);
@@ -191,10 +212,13 @@ document.getElementById('go').onclick = async () => {
         // 空闲超时：每个请求独立计时，且每次读到一个数据块就重新计时。
         // 于是镜像「挂住不动」超过 REQ_TIMEOUT_MS 必定响亮失败——不会不再出进度行、
         // 变成无法归因的停住；同时也不会误杀只是慢、但一直在出数据的镜像。
-        let tid, wtid;
+        let tid, wtid, cdeadline;
+        let chunkTimedOut = false;
         const arm = () => { clearTimeout(tid); tid = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS); };
         try {
           arm();
+          // 分块墙钟死线：独立于 arm() 的空闲计时。arm() 会被滴水重置，这个不会。
+          cdeadline = setTimeout(() => { chunkTimedOut = true; ac.abort(); }, CHUNK_DEADLINE_MS);
           let res;
           try {
             res = await fetch(prefix + URL_, {
@@ -222,6 +246,9 @@ document.getElementById('go').onclick = async () => {
             try {
               r = await reader.read();
             } catch (e) {
+              if (chunkTimedOut) {
+                throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 分块墙钟超时（${CHUNK_DEADLINE_MS / 1000}s 未完成，已读到 ${pos}）：疑似该镜像滴水式限速，换镜像重跑`);
+              }
               throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 流中断/超时（已读到 ${pos}）: ${e.name} ${e.message}`);
             }
             if (r.done) break;
@@ -254,6 +281,7 @@ document.getElementById('go').onclick = async () => {
         } finally {
           clearTimeout(tid);
           clearTimeout(wtid);
+          clearTimeout(cdeadline);
           inflight.delete(ac);
         }
       }
