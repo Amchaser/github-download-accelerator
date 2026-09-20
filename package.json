@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "mirrors": "node --use-system-ca scripts/check-mirrors.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
