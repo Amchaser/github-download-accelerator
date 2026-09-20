@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>FSA 并行定位写入 spike</title>
+<body>
+<button id="go">开始</button>
+<pre id="log"></pre>
+<script>
+const URL_ = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
+const MIRRORS = ['https://gh.xmly.dev/', 'https://gh.xxooo.cf/', 'https://gh.ddlc.top/', 'https://gh.monlor.com/'];
+const CHUNK = 8 * 1024 * 1024;
+const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+
+document.getElementById('go').onclick = async () => {
+  const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' } });
+  const total = Number(res0.headers.get('content-range').split('/')[1]);
+  log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
+
+  const handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
+  const stream = await handle.createWritable();
+
+  const t0 = performance.now();
+  let done = 0, peakHeap = 0;
+  const ranges = [];
+  for (let s = 0; s < total; s += CHUNK) ranges.push([s, Math.min(s + CHUNK, total) - 1]);
+  log(`chunks = ${ranges.length}`);
+
+  let next = 0;
+  async function worker(prefix) {
+    while (next < ranges.length) {
+      const [start, end] = ranges[next++];
+      const res = await fetch(prefix + URL_, { headers: { Range: `bytes=${start}-${end}` } });
+      if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
+      const reader = res.body.getReader();
+      let pos = start;
+      for (;;) {
+        const { done: d, value } = await reader.read();
+        if (d) break;
+        await stream.write({ type: 'write', position: pos, data: value });
+        pos += value.length;
+        done += value.length;
+      }
+      if (pos !== end + 1) throw new Error(`short chunk: ${pos} != ${end + 1}`);
+      peakHeap = Math.max(peakHeap, performance.memory?.usedJSHeapSize ?? 0);
+      const secs = (performance.now() - t0) / 1000;
+      log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${(peakHeap / 1048576).toFixed(0)}MiB`);
+    }
+  }
+
+  try {
+    await Promise.all(MIRRORS.map(worker));
+    await stream.close();
+    const secs = (performance.now() - t0) / 1000;
+    log(`完成: ${(total / 1048576 / secs).toFixed(2)} MiB/s, 峰值堆 ${(peakHeap / 1048576).toFixed(0)} MiB`);
+  } catch (e) {
+    await stream.abort();
+    log(`失败: ${e.message}`);
+  }
+};
+</script>
+</body>
+</html>
