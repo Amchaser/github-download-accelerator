@@ -160,6 +160,11 @@ document.getElementById('go').onclick = async () => {
     let lastSeenDone = -1;
     let lastProgressAt = performance.now();
     const WATCHDOG_MS = 45000;
+    // 看门狗不仅要「报告」，更要能「强制结束」：若某个 worker 永久卡在一次不 resolve
+    // 的 await 里，Promise.all 永不 settle，外层 catch 永不执行，日志就永远没有失败行
+    // ——静默停住。用 Promise.race 保证必然走到 catch。
+    let watchdogReject;
+    const watchdogFailure = new Promise((_, rej) => { watchdogReject = rej; });
     watchdog = setInterval(() => {
       if (done !== lastSeenDone) {
         lastSeenDone = done;
@@ -171,8 +176,8 @@ document.getElementById('go').onclick = async () => {
       aborted = true;
       for (const a of inflight) { try { a.abort(); } catch (e) {} }
       log(`[看门狗] 已有 ${idle.toFixed(0)}s 没有任何字节进展，判定为停住（在途请求 ${inflight.size} 个）。`);
-      log('[看门狗] 这多半不是定位写入的问题，而是某个镜像的流卡住、或浏览器没把 abort 传导到流读取。');
-      log('[看门狗] 若当前不是真正的 Chrome/Edge（如 360、QQ 等套壳内核），请换 Chrome/Edge 重跑再下结论。');
+      log('[看门狗] 这是某个流卡住、或该流未被 abort 打断，不是定位写入的问题。');
+      watchdogReject(new Error(`[看门狗] 停住：${idle.toFixed(0)}s 无字节进展，在途请求 ${inflight.size} 个（流卡住，非定位写入问题）`));
     }, 2000);
 
     // 所有抛出的错误都带上「镜像 prefix + 精确字节区间」，
@@ -257,7 +262,7 @@ document.getElementById('go').onclick = async () => {
     const prefixes = MIRRORS.slice(0, WORKERS);
     if (WORKERS > MIRRORS.length) log(`注意: WORKERS=${WORKERS} 超过镜像数 ${MIRRORS.length}，实际只用 ${prefixes.length} 个 worker`);
     log(`实际启动 worker 数 = ${prefixes.length}`);
-    await Promise.all(prefixes.map(worker));
+    await Promise.race([Promise.all(prefixes.map(worker)), watchdogFailure]);
     clearInterval(watchdog);
     // close() 阶段没有任何进度输出（done 不再增长，看门狗已停），但 500MB 的落盘 +
     // 原子替换可能要等一会。明确说出来，避免把「正在落盘」误判成「卡死」——
@@ -297,13 +302,16 @@ document.getElementById('go').onclick = async () => {
     }
   } catch (e) {
     aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
-    sampleHeap();                          // 失败前最后采一次，让下面的 peak 覆盖到失败时刻
+    sampleHeap();                          // 失败前最后采一次，让 peak 覆盖到失败时刻
+    // 先落诊断，再做任何可能挂住的清理。清理里含 await stream.abort()——若该 promise
+    // 在某些实现下不 settle，把 log 放在其后会让失败原因永远打不出来。实测疑似正是这个
+    // 形态：跑到 98.5% 静默停住、目标文件 0 字节、日志里没有任何失败行。
+    log(`失败: ${e && e.message}  peak=${fmtHeap(peakHeap)}`);
+    logFailureAttribution(e && e.message);
     clearInterval(heapTimer);
     clearInterval(watchdog);
     for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
-    log(`失败: ${e && e.message}  peak=${fmtHeap(peakHeap)}`);
-    logFailureAttribution(e && e.message);
   }
 };
 </script>
