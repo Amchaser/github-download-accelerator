@@ -1,0 +1,2052 @@
+# GitHub Release 加速下载器 实现计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 构建一个纯前端单页应用，粘贴 GitHub Release 链接即可通过多镜像并行 Range 分块高速下载，零后端、零安装。
+
+**Architecture:** 浏览器直接 `fetch()` 4 个已验证支持 CORS 的公共 GitHub 代理镜像，每个镜像作为独立 origin 起一个 work-stealing 循环抢块下载，各块通过 File System Access API 的 `write({position})` 直接落到目标文件。并行度来自 **origin 数**（HTTP/2 下同源仅一条 TCP 连接），因此分块必须跨镜像分散而非堆在单一镜像上。
+
+**Tech Stack:** TypeScript + Vite（构建/dev server）+ Vitest（单元测试）。无 UI 框架，直接操作 DOM。
+
+## Global Constraints
+
+- **镜像白名单固定为 4 个**（实测同时具备 Range + CORS）：`gh.xmly.dev`、`gh.xxooo.cf`、`gh.ddlc.top`、`gh.monlor.com`。不得使用 `gh-proxy.com` / `ghproxy.net` 等无 CORS 头者，浏览器无法读取其响应。
+- **默认块大小 8 MiB**（`8 * 1024 * 1024`）。块大小下限 1 MiB。
+- **永远通过原始 GitHub URL 发起请求**：`mirrorPrefix + originalUrl`，让镜像每次自行 follow 302。302 落点是限时签名 URL，禁止缓存。
+- **任何 Range 响应必须校验 `status === 206` 且 `Content-Range` 前缀等于 `bytes ${start}-${end}/`**。收到 `200` 表示上游忽略 Range，此时把整包写入部分文件会静默产出损坏文件——必须判定为失败。
+- **禁止对响应体调用 `.blob()` / `.arrayBuffer()`**。只允许 `body.getReader()` 流式读取，读到即写即弃。
+- **`sink.write()` 必须 `await` 串行化**，不得并发调用。
+- **`createWritable()` 不得传 `keepExistingData: true`**。
+- **能力检测必须检测 `createWritable`**，而非仅检测 `showSaveFilePicker`。
+- 目标浏览器：Chromium 内核（Chrome / Edge / Opera）。Firefox 与 Safari 走 `<a download>` 回退路径。
+- 所有源码文件用 TypeScript，`strict: true`。
+
+---
+
+### Task 1: FSA 并行定位写入 spike（风险闸门）
+
+**这是全项目最高风险项，必须先做。** 规范允许对同一个 `FileSystemWritableFileStream` 做并行定位写入，但调研未找到任何先例项目验证过——所有认真的浏览器多线程下载产品都配了原生 helper 绕开浏览器。**本任务不通过则整个架构需要改（改用 IndexedDB 拼装或顺序写入），后续任务全部作废。**
+
+本任务不引入任何工具链，只写一个独立 HTML 文件，手工验证。
+
+**Files:**
+- Create: `spike/fsa-parallel.html`
+
+**Interfaces:**
+- Consumes: 无
+- Produces: 对「并行定位写入是否可靠」的明确判定结论（通过 / 不通过 + 内存与校验和数据）
+
+- [ ] **Step 1: 写 spike 页面**
+
+创建 `spike/fsa-parallel.html`：
+
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>FSA 并行定位写入 spike</title>
+<body>
+<button id="go">开始</button>
+<pre id="log"></pre>
+<script>
+const URL_ = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
+const MIRRORS = ['https://gh.xmly.dev/', 'https://gh.xxooo.cf/', 'https://gh.ddlc.top/', 'https://gh.monlor.com/'];
+const CHUNK = 8 * 1024 * 1024;
+const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+
+document.getElementById('go').onclick = async () => {
+  const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' } });
+  const total = Number(res0.headers.get('content-range').split('/')[1]);
+  log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
+
+  const handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
+  const stream = await handle.createWritable();
+
+  const t0 = performance.now();
+  let done = 0, peakHeap = 0;
+  const ranges = [];
+  for (let s = 0; s < total; s += CHUNK) ranges.push([s, Math.min(s + CHUNK, total) - 1]);
+  log(`chunks = ${ranges.length}`);
+
+  let next = 0;
+  async function worker(prefix) {
+    while (next < ranges.length) {
+      const [start, end] = ranges[next++];
+      const res = await fetch(prefix + URL_, { headers: { Range: `bytes=${start}-${end}` } });
+      if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
+      const reader = res.body.getReader();
+      let pos = start;
+      for (;;) {
+        const { done: d, value } = await reader.read();
+        if (d) break;
+        await stream.write({ type: 'write', position: pos, data: value });
+        pos += value.length;
+        done += value.length;
+      }
+      if (pos !== end + 1) throw new Error(`short chunk: ${pos} != ${end + 1}`);
+      peakHeap = Math.max(peakHeap, performance.memory?.usedJSHeapSize ?? 0);
+      const secs = (performance.now() - t0) / 1000;
+      log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${(peakHeap / 1048576).toFixed(0)}MiB`);
+    }
+  }
+
+  try {
+    await Promise.all(MIRRORS.map(worker));
+    await stream.close();
+    const secs = (performance.now() - t0) / 1000;
+    log(`完成: ${(total / 1048576 / secs).toFixed(2)} MiB/s, 峰值堆 ${(peakHeap / 1048576).toFixed(0)} MiB`);
+  } catch (e) {
+    await stream.abort();
+    log(`失败: ${e.message}`);
+  }
+};
+</script>
+</body>
+</html>
+```
+
+- [ ] **Step 2: 起本地服务器并打开**
+
+`file://` 不是可靠的安全上下文，必须走 localhost：
+
+```bash
+cd "D:/github_download++/spike" && python -m http.server 8000
+```
+
+浏览器打开 `http://localhost:8000/fsa-parallel.html`。
+
+- [ ] **Step 3: 跑并记录**
+
+点击「开始」，选择保存位置，等待完成。记录三个数据：
+
+1. **最终速度**（MiB/s）
+2. **峰值 JS 堆**（页面日志里的 `heap=`）——若随下载量线性增长，说明有累积，不通过
+3. **文件 SHA-256**
+
+算 SHA-256：
+
+```bash
+certutil -hashfile "下载到的文件路径" SHA256
+```
+
+- [ ] **Step 4: 校验正确性**
+
+预期总大小 `499558899` 字节。确认 `certutil` 输出的文件大小与之完全一致。
+
+再跑一次原始直链下载同一文件用于比对哈希（可选，若直连太慢可跳过，仅凭大小判断）：
+
+```bash
+curl -skL -o /tmp/ref.exe "https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe" --max-time 300
+certutil -hashfile /tmp/ref.exe SHA256
+```
+
+两次 SHA-256 必须一致。
+
+- [ ] **Step 5: 判定并提交结论**
+
+**通过条件（全部满足）**：
+- SHA-256 与参照一致，或文件大小精确等于 `499558899`
+- 速度显著优于 0.06 MB/s 的直连基线（预期 > 3 MB/s）
+- 峰值堆稳定在几百 MiB 以内，不随下载字节数线性增长
+
+**不通过** → 停止，回报用户，改走 IndexedDB 拼装或顺序写入方案，本计划需重写。
+
+```bash
+cd "D:/github_download++" && git add spike/fsa-parallel.html && git commit -m "spike: 验证 FSA 并行定位写入可行性"
+```
+
+---
+
+### Task 2: 项目脚手架
+
+**Files:**
+- Create: `package.json`
+- Create: `tsconfig.json`
+- Create: `vite.config.ts`
+- Create: `src/types.ts`
+- Create: `tests/smoke.test.ts`
+- Create: `.gitignore`
+
+**Interfaces:**
+- Consumes: 无
+- Produces: 可运行的 `npm test` / `npm run dev` / `npm run build`；`src/types.ts` 中的 `Chunk`、`Mirror`、`Sink`、`ProbeResult` 类型
+
+- [ ] **Step 1: 初始化并安装依赖**
+
+```bash
+cd "D:/github_download++" && npm init -y && npm i -D typescript vite vitest @types/node
+```
+
+- [ ] **Step 2: 写配置文件**
+
+`tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src", "tests"]
+}
+```
+
+`vite.config.ts`：
+
+```ts
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  root: '.',
+  build: { outDir: 'dist' },
+  test: { globals: true, environment: 'node' },
+});
+```
+
+`.gitignore`：
+
+```
+node_modules/
+dist/
+```
+
+`package.json` 的 `scripts` 改为：
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+- [ ] **Step 3: 定义共享类型**
+
+创建 `src/types.ts`：
+
+```ts
+/** 一段待下载的字节区间，闭区间（end 为最后一个字节的下标）。 */
+export interface Chunk {
+  index: number;
+  start: number;
+  end: number;
+}
+
+/** 一个 GitHub 代理镜像。prefix 形如 "https://gh.xmly.dev/"，用法为 prefix + 原始 GitHub URL。 */
+export interface Mirror {
+  id: string;
+  prefix: string;
+}
+
+/** 下载落盘目标。实现可以是 FSA，也可以是内存回退。 */
+export interface Sink {
+  /** 从文件顶部起 position 字节处写入 data。实现必须串行化，调用方会 await。 */
+  write(position: number, data: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+export interface ProbeResult {
+  mirror: Mirror;
+  ok: boolean;
+  bytesPerSec: number;
+  ttfbMs: number;
+}
+
+/** 从 Release URL 解析出的坐标。 */
+export interface ReleaseRef {
+  owner: string;
+  repo: string;
+  tag: string;
+  file: string;
+}
+
+/** 资源元数据。acceptRanges 为 false 时不得分块。 */
+export interface AssetMeta {
+  total: number;
+  filename: string;
+  acceptRanges: boolean;
+}
+```
+
+- [ ] **Step 4: 写冒烟测试**
+
+创建 `tests/smoke.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+
+describe('脚手架', () => {
+  it('TypeScript 与 Vitest 可运行', () => {
+    const n: number = 1 + 1;
+    expect(n).toBe(2);
+  });
+});
+```
+
+- [ ] **Step 5: 验证**
+
+```bash
+cd "D:/github_download++" && npm run typecheck && npm test
+```
+
+预期：typecheck 无错，测试 1 passed。
+
+- [ ] **Step 6: 提交**
+
+```bash
+cd "D:/github_download++" && git add -A && git commit -m "chore: Vite + TypeScript + Vitest 脚手架与共享类型"
+```
+
+---
+
+### Task 3: `planner.ts` 分块规划（TDD）
+
+**Files:**
+- Create: `src/planner.ts`
+- Test: `tests/planner.test.ts`
+
+**Interfaces:**
+- Consumes: `src/types.ts` 的 `Chunk`
+- Produces: `DEFAULT_CHUNK_SIZE: number`（`8388608`）、`MIN_CHUNK_SIZE: number`（`1048576`）、`plan(total: number, chunkSize?: number): Chunk[]`、`splitChunk(chunk: Chunk): [Chunk, Chunk] | null`
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/planner.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { plan, splitChunk, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE } from '../src/planner';
+
+describe('plan', () => {
+  it('总长为 0 时返回空数组', () => {
+    expect(plan(0)).toEqual([]);
+  });
+
+  it('整除时块数与区间正确', () => {
+    expect(plan(8, 4)).toEqual([
+      { index: 0, start: 0, end: 3 },
+      { index: 1, start: 4, end: 7 },
+    ]);
+  });
+
+  it('不整除时最后一块被截断到 total-1', () => {
+    expect(plan(10, 4)).toEqual([
+      { index: 0, start: 0, end: 3 },
+      { index: 1, start: 4, end: 7 },
+      { index: 2, start: 8, end: 9 },
+    ]);
+  });
+
+  it('total 小于块大小时只有一块', () => {
+    expect(plan(3, 100)).toEqual([{ index: 0, start: 0, end: 2 }]);
+  });
+
+  it('覆盖全部字节且无缝隙无重叠', () => {
+    const chunks = plan(499558899, DEFAULT_CHUNK_SIZE);
+    expect(chunks[0].start).toBe(0);
+    expect(chunks[chunks.length - 1].end).toBe(499558899 - 1);
+    for (let i = 1; i < chunks.length; i++) {
+      expect(chunks[i].start).toBe(chunks[i - 1].end + 1);
+    }
+  });
+
+  it('拒绝负数与非整数', () => {
+    expect(() => plan(-1)).toThrow();
+    expect(() => plan(1.5)).toThrow();
+    expect(() => plan(10, 0)).toThrow();
+  });
+});
+
+describe('splitChunk', () => {
+  it('把一块均分为两块', () => {
+    expect(splitChunk({ index: 0, start: 0, end: 9 })).toEqual([
+      { index: 0, start: 0, end: 4 },
+      { index: 1, start: 5, end: 9 },
+    ]);
+  });
+
+  it('奇数长度时前半段较短', () => {
+    expect(splitChunk({ index: 0, start: 0, end: 8 })).toEqual([
+      { index: 0, start: 0, end: 3 },
+      { index: 1, start: 4, end: 8 },
+    ]);
+  });
+
+  it('单字节块无法再分，返回 null', () => {
+    expect(splitChunk({ index: 0, start: 5, end: 5 })).toBeNull();
+  });
+
+  it('已到 MIN_CHUNK_SIZE 的块返回 null', () => {
+    expect(splitChunk({ index: 0, start: 0, end: MIN_CHUNK_SIZE - 1 })).toBeNull();
+  });
+
+  it('可用 minChunkSize 覆盖默认下限（测试与小文件场景需要）', () => {
+    expect(splitChunk({ index: 0, start: 0, end: 1023 }, 256)).toEqual([
+      { index: 0, start: 0, end: 511 },
+      { index: 1, start: 512, end: 1023 },
+    ]);
+    expect(splitChunk({ index: 0, start: 0, end: 511 }, 256)).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/planner.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/planner"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/planner.ts`：
+
+```ts
+import type { Chunk } from './types';
+
+/** 默认块大小 8 MiB。取保守值以规避「大 Range 被 403」的上游限制（参见 aria2 issue #1627）。 */
+export const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
+
+/** 块大小下限。小于此值仍失败则判定为硬失败，不再继续拆分。 */
+export const MIN_CHUNK_SIZE = 1024 * 1024;
+
+export function plan(total: number, chunkSize: number = DEFAULT_CHUNK_SIZE): Chunk[] {
+  if (!Number.isInteger(total) || total < 0) {
+    throw new Error(`total 必须是非负整数，收到 ${total}`);
+  }
+  if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+    throw new Error(`chunkSize 必须是正整数，收到 ${chunkSize}`);
+  }
+  if (total === 0) return [];
+
+  const chunks: Chunk[] = [];
+  let index = 0;
+  for (let start = 0; start < total; start += chunkSize) {
+    chunks.push({ index: index++, start, end: Math.min(start + chunkSize, total) - 1 });
+  }
+  return chunks;
+}
+
+/**
+ * 把一块均分为两块。用于「大 Range 被 403」时的本地递归降级。
+ * 块长度不足 minChunkSize * 2 时返回 null，表示已达拆分下限。
+ * minChunkSize 可覆盖是为了让测试能用小体积数据驱动拆分逻辑。
+ */
+export function splitChunk(chunk: Chunk, minChunkSize: number = MIN_CHUNK_SIZE): [Chunk, Chunk] | null {
+  const len = chunk.end - chunk.start + 1;
+  if (len < minChunkSize * 2) return null;
+  const mid = chunk.start + Math.floor(len / 2);
+  return [
+    { index: 0, start: chunk.start, end: mid - 1 },
+    { index: 1, start: mid, end: chunk.end },
+  ];
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/planner.test.ts
+```
+
+预期：10 passed。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd "D:/github_download++" && git add src/planner.ts tests/planner.test.ts && git commit -m "feat: 分块规划与块拆分"
+```
+
+---
+
+### Task 4: `resolver.ts` 解析 URL 与元数据（TDD）
+
+**Files:**
+- Create: `src/resolver.ts`
+- Test: `tests/resolver.test.ts`
+
+**Interfaces:**
+- Consumes: `src/types.ts` 的 `ReleaseRef`、`AssetMeta`
+- Produces: `parseReleaseUrl(raw: string): ReleaseRef`、`resolveMetadata(url: string, mirrorPrefix: string, fetchFn?: typeof fetch): Promise<AssetMeta>`
+
+**设计要点：** 用 `Range: bytes=0-0` 的 GET 而非 HEAD，一次请求同时拿到总大小与 Range 支持情况（206 → 支持，200 → 不支持），减少往返。
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/resolver.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { parseReleaseUrl, resolveMetadata } from '../src/resolver';
+
+const GOOD = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
+
+describe('parseReleaseUrl', () => {
+  it('解析标准 Release 链接', () => {
+    expect(parseReleaseUrl(GOOD)).toEqual({
+      owner: 'babalae',
+      repo: 'better-genshin-impact',
+      tag: '0.65.0',
+      file: 'BetterGI.Install.0.65.0.exe',
+    });
+  });
+
+  it('对文件名做 URL 解码', () => {
+    const u = 'https://github.com/o/r/releases/download/v1/a%20b.zip';
+    expect(parseReleaseUrl(u).file).toBe('a b.zip');
+  });
+
+  it('容忍首尾空白', () => {
+    expect(parseReleaseUrl(`  ${GOOD}  `).owner).toBe('babalae');
+  });
+
+  it('拒绝非 Release 链接', () => {
+    expect(() => parseReleaseUrl('https://github.com/o/r')).toThrow(/不是有效的/);
+    expect(() => parseReleaseUrl('https://example.com/a.exe')).toThrow(/不是有效的/);
+    expect(() => parseReleaseUrl('')).toThrow(/不是有效的/);
+  });
+
+  it('拒绝 raw/blob 链接（本工具只处理 Release 资产）', () => {
+    expect(() => parseReleaseUrl('https://github.com/o/r/raw/main/a.exe')).toThrow();
+    expect(() => parseReleaseUrl('https://github.com/o/r/blob/main/a.exe')).toThrow();
+  });
+});
+
+/** 造一个假的 fetch，返回指定的 status 与 headers。 */
+function fakeFetch(status: number, headers: Record<string, string>) {
+  return (async () => new Response(null, { status, headers })) as unknown as typeof fetch;
+}
+
+describe('resolveMetadata', () => {
+  it('206 时从 Content-Range 取总大小，并判定支持 Range', async () => {
+    const f = fakeFetch(206, {
+      'content-range': 'bytes 0-0/499558899',
+      'content-disposition': 'attachment; filename="BetterGI.Install.0.65.0.exe"',
+    });
+    const meta = await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(meta).toEqual({
+      total: 499558899,
+      filename: 'BetterGI.Install.0.65.0.exe',
+      acceptRanges: true,
+    });
+  });
+
+  it('200 时从 Content-Length 取总大小，并判定不支持 Range', async () => {
+    const f = fakeFetch(200, { 'content-length': '12345' });
+    const meta = await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(meta.total).toBe(12345);
+    expect(meta.acceptRanges).toBe(false);
+  });
+
+  it('Content-Disposition 缺失时回退到 URL 末段文件名', async () => {
+    const f = fakeFetch(206, { 'content-range': 'bytes 0-0/100' });
+    const meta = await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(meta.filename).toBe('BetterGI.Install.0.65.0.exe');
+  });
+
+  it('无法确定总大小时抛错', async () => {
+    const f = fakeFetch(200, {});
+    await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/无法确定/);
+  });
+
+  it('非 2xx/206 状态抛错', async () => {
+    const f = fakeFetch(403, {});
+    await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/403/);
+  });
+
+  it('请求的是镜像前缀 + 原始 URL', async () => {
+    let seen = '';
+    const f = (async (input: RequestInfo | URL) => {
+      seen = String(input);
+      return new Response(null, { status: 206, headers: { 'content-range': 'bytes 0-0/100' } });
+    }) as unknown as typeof fetch;
+    await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(seen).toBe(`https://gh.xmly.dev/${GOOD}`);
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/resolver.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/resolver"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/resolver.ts`：
+
+```ts
+import type { AssetMeta, ReleaseRef } from './types';
+
+const RELEASE_RE =
+  /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/releases\/download\/([^/\s]+)\/([^\s]+)$/;
+
+export function parseReleaseUrl(raw: string): ReleaseRef {
+  const m = RELEASE_RE.exec(raw.trim());
+  if (!m) {
+    throw new Error(
+      '不是有效的 GitHub Release 下载链接（应形如 https://github.com/owner/repo/releases/download/tag/file）',
+    );
+  }
+  return { owner: m[1], repo: m[2], tag: m[3], file: decodeURIComponent(m[4]) };
+}
+
+function filenameFromDisposition(value: string | null): string | null {
+  if (!value) return null;
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(value);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+/**
+ * 取资源元数据。用 `Range: bytes=0-0` 的单次 GET 同时得到总大小与 Range 支持情况：
+ * 206 → 支持；200 → 上游忽略 Range，必须降级为单连接下载。
+ */
+export async function resolveMetadata(
+  url: string,
+  mirrorPrefix: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<AssetMeta> {
+  const res = await fetchFn(mirrorPrefix + url, { headers: { Range: 'bytes=0-0' } });
+
+  if (res.status !== 206 && !res.ok) {
+    throw new Error(`镜像返回 HTTP ${res.status}`);
+  }
+
+  const acceptRanges = res.status === 206;
+  let total: number | null = null;
+
+  if (acceptRanges) {
+    const cr = res.headers.get('content-range');
+    const m = cr ? /\/(\d+)\s*$/.exec(cr) : null;
+    if (m) total = Number(m[1]);
+  }
+  if (total === null) {
+    const len = res.headers.get('content-length');
+    if (len) total = Number(len);
+  }
+  if (total === null || !Number.isFinite(total) || total <= 0) {
+    throw new Error('无法确定资源大小（响应既无 Content-Range 也无有效 Content-Length）');
+  }
+
+  const filename =
+    filenameFromDisposition(res.headers.get('content-disposition')) ??
+    decodeURIComponent(url.split('/').pop() ?? 'download.bin');
+
+  return { total, filename, acceptRanges };
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/resolver.test.ts
+```
+
+预期：11 passed。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd "D:/github_download++" && git add src/resolver.ts tests/resolver.test.ts && git commit -m "feat: Release URL 解析与资源元数据探测"
+```
+
+---
+
+### Task 5: `mirrors.ts` 镜像注册表与健康度（TDD）
+
+**Files:**
+- Create: `src/mirrors.ts`
+- Test: `tests/mirrors.test.ts`
+
+**Interfaces:**
+- Consumes: `src/types.ts` 的 `Mirror`、`ProbeResult`
+- Produces: `KNOWN_MIRRORS: Mirror[]`、`class MirrorPool`，含 `available(): Mirror[]`、`recordSuccess(id: string, bytesPerSec: number): void`、`recordFailure(id: string): void`、`ranked(): Mirror[]`
+
+**设计要点：** 仅 4 个实测可用的镜像。健康度用「成功率 + 最近吞吐」排序，失败累计到阈值即降权到队尾，避免反复用坏镜像拖慢整体。
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/mirrors.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { KNOWN_MIRRORS, MirrorPool, FAILURE_DEMOTE_THRESHOLD } from '../src/mirrors';
+
+describe('KNOWN_MIRRORS', () => {
+  it('恰好 4 个，且 prefix 以 / 结尾（拼接原始 URL 的前提）', () => {
+    expect(KNOWN_MIRRORS).toHaveLength(4);
+    for (const m of KNOWN_MIRRORS) {
+      expect(m.prefix.endsWith('/')).toBe(true);
+      expect(m.prefix.startsWith('https://')).toBe(true);
+    }
+  });
+
+  it('id 唯一', () => {
+    const ids = KNOWN_MIRRORS.map((m) => m.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('不包含已知无 CORS 头的镜像', () => {
+    const banned = ['gh-proxy.com', 'ghproxy.net', 'v6.gh-proxy.org', 'gh.noki.icu'];
+    for (const m of KNOWN_MIRRORS) {
+      for (const b of banned) expect(m.prefix).not.toContain(b);
+    }
+  });
+});
+
+describe('MirrorPool', () => {
+  it('初始按注册顺序返回全部镜像', () => {
+    expect(new MirrorPool().available().map((m) => m.id)).toEqual(
+      KNOWN_MIRRORS.map((m) => m.id),
+    );
+  });
+
+  it('记录的吞吐越高排得越前', () => {
+    const p = new MirrorPool();
+    p.recordSuccess('monlor', 10 * 1048576);
+    expect(p.ranked()[0].id).toBe('monlor');
+  });
+
+  it('连续失败到阈值后被降权到队尾', () => {
+    const p = new MirrorPool();
+    p.recordSuccess('xmly', 5 * 1048576);
+    for (let i = 0; i < FAILURE_DEMOTE_THRESHOLD; i++) p.recordFailure('xmly');
+    expect(p.ranked()[p.ranked().length - 1].id).toBe('xmly');
+  });
+
+  it('成功一次即清除失败计数', () => {
+    const p = new MirrorPool();
+    for (let i = 0; i < FAILURE_DEMOTE_THRESHOLD; i++) p.recordFailure('ddlc');
+    p.recordSuccess('ddlc', 1024);
+    expect(p.ranked().map((m) => m.id).filter((id) => id === 'ddlc')).toHaveLength(1);
+    expect(p.ranked()[p.ranked().length - 1].id).not.toBe('ddlc');
+  });
+
+  it('未测速的镜像排在已测速的之后', () => {
+    const p = new MirrorPool();
+    p.recordSuccess('xxooo', 1048576);
+    expect(p.ranked()[p.ranked().length - 1].id).not.toBe('xxooo');
+  });
+
+  it('available 不因失败而减少（失败只降权，不移除）', () => {
+    const p = new MirrorPool();
+    for (let i = 0; i < FAILURE_DEMOTE_THRESHOLD * 2; i++) p.recordFailure('xmly');
+    expect(p.available()).toHaveLength(KNOWN_MIRRORS.length);
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/mirrors.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/mirrors"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/mirrors.ts`：
+
+```ts
+import type { Mirror } from './types';
+
+/**
+ * 仅收录 2026-09-20 实测同时具备 Range 与 CORS 响应的镜像。
+ * gh-proxy.com / ghproxy.net 等虽支持 Range 且更快，但不发
+ * Access-Control-Allow-Origin，浏览器读不到响应，故排除。
+ */
+export const KNOWN_MIRRORS: Mirror[] = [
+  { id: 'xmly', prefix: 'https://gh.xmly.dev/' },
+  { id: 'xxooo', prefix: 'https://gh.xxooo.cf/' },
+  { id: 'ddlc', prefix: 'https://gh.ddlc.top/' },
+  { id: 'monlor', prefix: 'https://gh.monlor.com/' },
+];
+
+/** 连续失败达到此次数即降权到队尾。 */
+export const FAILURE_DEMOTE_THRESHOLD = 3;
+
+interface Health {
+  consecutiveFailures: number;
+  bytesPerSec: number | null;
+}
+
+export class MirrorPool {
+  private readonly health = new Map<string, Health>();
+
+  constructor(private readonly mirrors: Mirror[] = KNOWN_MIRRORS) {
+    for (const m of mirrors) {
+      this.health.set(m.id, { consecutiveFailures: 0, bytesPerSec: null });
+    }
+  }
+
+  available(): Mirror[] {
+    return [...this.mirrors];
+  }
+
+  recordSuccess(id: string, bytesPerSec: number): void {
+    const h = this.health.get(id);
+    if (!h) return;
+    h.consecutiveFailures = 0;
+    h.bytesPerSec = bytesPerSec;
+  }
+
+  recordFailure(id: string): void {
+    const h = this.health.get(id);
+    if (!h) return;
+    h.consecutiveFailures += 1;
+  }
+
+  /** 降权镜像排到队尾；已测速者按吞吐降序排在未测速者之前。 */
+  ranked(): Mirror[] {
+    return [...this.mirrors].sort((a, b) => this.score(a.id) - this.score(b.id));
+  }
+
+  /** 分数越小越靠前。降权镜像直接给一个大偏移。 */
+  private score(id: string): number {
+    const h = this.health.get(id);
+    if (!h) return Number.MAX_SAFE_INTEGER;
+    const demoted = h.consecutiveFailures >= FAILURE_DEMOTE_THRESHOLD ? 1e15 : 0;
+    const measured = h.bytesPerSec === null ? 1e12 : -h.bytesPerSec;
+    return demoted + measured;
+  }
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/mirrors.test.ts
+```
+
+预期：10 passed。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd "D:/github_download++" && git add src/mirrors.ts tests/mirrors.test.ts && git commit -m "feat: 镜像注册表与健康度排序"
+```
+
+---
+
+### Task 6: `probe.ts` 镜像测速优选（TDD）
+
+**Files:**
+- Create: `src/probe.ts`
+- Test: `tests/probe.test.ts`
+
+**Interfaces:**
+- Consumes: `src/types.ts` 的 `Mirror`、`ProbeResult`
+- Produces: `PROBE_BYTES: number`（`524288`）、`probeMirrors(url: string, mirrors: Mirror[], fetchFn?: typeof fetch, timeoutMs?: number): Promise<ProbeResult[]>`
+
+**设计要点：** 对每个镜像发 512 KiB 的 Range 请求，记录 TTFB 与吞吐。超时或出错标记 `ok: false`。所有镜像的探测**并发**执行，总耗时 = 最慢的那个。
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/probe.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { probeMirrors, PROBE_BYTES } from '../src/probe';
+import type { Mirror } from '../src/types';
+
+const URL_ = 'https://github.com/o/r/releases/download/v1/a.exe';
+const M: Mirror[] = [
+  { id: 'a', prefix: 'https://a.test/' },
+  { id: 'b', prefix: 'https://b.test/' },
+];
+
+/** 造一个返回 bodyLen 字节的 206 响应。 */
+function okFetch(bodyLen: number) {
+  return (async () =>
+    new Response(new Uint8Array(bodyLen), {
+      status: 206,
+      headers: { 'content-range': `bytes 0-${bodyLen - 1}/999999` },
+    })) as unknown as typeof fetch;
+}
+
+describe('probeMirrors', () => {
+  it('返回每个镜像的结果', async () => {
+    const r = await probeMirrors(URL_, M, okFetch(1024));
+    expect(r).toHaveLength(2);
+    expect(r.every((x) => x.ok)).toBe(true);
+  });
+
+  it('请求 512 KiB 的 Range', async () => {
+    const seen: string[] = [];
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      seen.push((init?.headers as Record<string, string>).Range);
+      return new Response(new Uint8Array(16), { status: 206, headers: {} });
+    }) as unknown as typeof fetch;
+    await probeMirrors(URL_, M, f);
+    expect(seen).toEqual([`bytes=0-${PROBE_BYTES - 1}`, `bytes=0-${PROBE_BYTES - 1}`]);
+  });
+
+  it('非 206 的镜像标记为不可用', async () => {
+    const f = (async () => new Response(null, { status: 403 })) as unknown as typeof fetch;
+    const r = await probeMirrors(URL_, M, f);
+    expect(r.every((x) => x.ok === false)).toBe(true);
+    expect(r.every((x) => x.bytesPerSec === 0)).toBe(true);
+  });
+
+  it('抛异常的镜像标记为不可用而不影响其他镜像', async () => {
+    const f = (async (i: RequestInfo | URL) => {
+      if (String(i).includes('a.test')) throw new Error('boom');
+      return new Response(new Uint8Array(64), { status: 206, headers: {} });
+    }) as unknown as typeof fetch;
+    const r = await probeMirrors(URL_, M, f);
+    expect(r.find((x) => x.mirror.id === 'a')!.ok).toBe(false);
+    expect(r.find((x) => x.mirror.id === 'b')!.ok).toBe(true);
+  });
+
+  it('超时的镜像标记为不可用', async () => {
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) =>
+      new Promise((_res, rej) => {
+        init?.signal?.addEventListener('abort', () => rej(new Error('aborted')));
+      })) as unknown as typeof fetch;
+    const r = await probeMirrors(URL_, M, f, 20);
+    expect(r.every((x) => x.ok === false)).toBe(true);
+  });
+
+  it('请求的是镜像前缀 + 原始 URL', async () => {
+    const seen: string[] = [];
+    const f = (async (i: RequestInfo | URL) => {
+      seen.push(String(i));
+      return new Response(new Uint8Array(8), { status: 206, headers: {} });
+    }) as unknown as typeof fetch;
+    await probeMirrors(URL_, M, f);
+    expect(seen).toContain(`https://a.test/${URL_}`);
+    expect(seen).toContain(`https://b.test/${URL_}`);
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/probe.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/probe"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/probe.ts`：
+
+```ts
+import type { Mirror, ProbeResult } from './types';
+
+/** 探针请求的字节数。512 KiB 足够让吞吐估计脱离 TTFB 主导，又不浪费带宽。 */
+export const PROBE_BYTES = 512 * 1024;
+
+export const PROBE_TIMEOUT_MS = 3000;
+
+async function probeOne(
+  url: string,
+  mirror: Mirror,
+  fetchFn: typeof fetch,
+  timeoutMs: number,
+): Promise<ProbeResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const t0 = Date.now();
+  try {
+    const res = await fetchFn(mirror.prefix + url, {
+      headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
+      signal: controller.signal,
+    });
+    if (res.status !== 206) {
+      return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+    }
+    const buf = await res.arrayBuffer();
+    const elapsed = (Date.now() - t0) / 1000;
+    if (buf.byteLength === 0 || elapsed <= 0) {
+      return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+    }
+    return {
+      mirror,
+      ok: true,
+      bytesPerSec: buf.byteLength / elapsed,
+      ttfbMs: Date.now() - t0,
+    };
+  } catch {
+    return { mirror, ok: false, bytesPerSec: 0, ttfbMs: Date.now() - t0 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 并发探测全部镜像，返回结果（顺序与入参一致）。
+ * 单个镜像失败不影响其他镜像。
+ */
+export async function probeMirrors(
+  url: string,
+  mirrors: Mirror[],
+  fetchFn: typeof fetch = fetch,
+  timeoutMs: number = PROBE_TIMEOUT_MS,
+): Promise<ProbeResult[]> {
+  return Promise.all(mirrors.map((m) => probeOne(url, m, fetchFn, timeoutMs)));
+}
+```
+
+> 注：`probeOne` 里对 512 KiB 用了 `arrayBuffer()`。这是刻意为之——探针体量固定且很小，一次读完最简单；**下载主路径（`engine.ts`）严禁如此**，必须流式。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/probe.test.ts
+```
+
+预期：6 passed。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd "D:/github_download++" && git add src/probe.ts tests/probe.test.ts && git commit -m "feat: 镜像并发测速优选"
+```
+
+---
+
+### Task 7: `engine.ts` 下载调度核心（TDD）
+
+**本任务是项目核心。** 用注入的假 `fetchFn` 与假 `Sink` 完整测试，不依赖浏览器。
+
+**Files:**
+- Create: `src/engine.ts`
+- Test: `tests/engine.test.ts`
+
+**Interfaces:**
+- Consumes: `task3` 的 `plan`/`splitChunk`/`MIN_CHUNK_SIZE`；`task5` 的 `MirrorPool`；`src/types.ts` 的 `Mirror`、`Sink`、`Chunk`
+- Produces: `download(opts: DownloadOptions): Promise<void>`；`class ChunkError extends Error`（带 `retryable: boolean`）
+
+**实现说明（相对 spec 的一处刻意简化）：** spec 第 6 节写的是「403 时全局减半块大小并重规划剩余区间」。本计划改为**对失败的那一块做本地递归对半拆分**（`splitChunk`）并重新入队。两者意图相同（把 Range 缩小），但本地拆分无需跨 worker 协调全局队列，实现简单得多且行为等价。
+
+**并发模型的关键约束：** 单个镜像失效**绝不能**导致整个下载失败——这是 spec 明确要求的容错。因此不能用朴素的「worker 抛出 → `Promise.all` 拒绝」写法：那会让 4 个镜像里任意一个坏掉就杀死全部工作。
+
+改用**未完块计数 `outstanding` + 重新入队**：worker 只在 `outstanding === 0` 时才退出；单块在某镜像上反复失败时，把它**放回队尾**而不是抛出，让其他健康镜像有机会接手。放回后本 worker 会先 `await` 退避（约 200ms），而空闲的对等 worker 每 10ms 轮询一次队列，因此健康镜像总能先抢到该块。只有 `outstanding` 无法归零（即所有镜像都救不回某块）时才判为整体失败。
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/engine.test.ts`：
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { download, ChunkError } from '../src/engine';
+import type { Mirror, Sink } from '../src/types';
+
+const URL_ = 'https://github.com/o/r/releases/download/v1/a.exe';
+const MIRRORS: Mirror[] = [
+  { id: 'a', prefix: 'https://a.test/' },
+  { id: 'b', prefix: 'https://b.test/' },
+];
+
+/** 内存 sink，记录每次写入，用于校验最终文件内容。 */
+class MemSink implements Sink {
+  readonly buf: Uint8Array;
+  readonly writes: { position: number; len: number }[] = [];
+  closed = false;
+  aborted = false;
+  constructor(size: number) {
+    this.buf = new Uint8Array(size);
+  }
+  async write(position: number, data: Uint8Array): Promise<void> {
+    this.buf.set(data, position);
+    this.writes.push({ position, len: data.byteLength });
+  }
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+  async abort(): Promise<void> {
+    this.aborted = true;
+  }
+}
+
+/** 造一个按 Range 返回确定性字节的服务端（字节值 = 位置 mod 251）。 */
+function rangeServer(total: number, opts: { failOn?: (start: number, end: number, mirrorPrefix: string) => number | null } = {}) {
+  const calls: { prefix: string; start: number; end: number }[] = [];
+  const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const prefix = MIRRORS.find((m) => url.startsWith(m.prefix))?.prefix;
+    if (!prefix) return new Response(null, { status: 404 });
+    const range = (init?.headers as Record<string, string>).Range;
+    const m = /bytes=(\d+)-(\d+)/.exec(range);
+    const start = Number(m![1]);
+    const end = Number(m![2]);
+    calls.push({ prefix, start, end });
+
+    const forced = opts.failOn?.(start, end, prefix);
+    if (forced) return new Response(null, { status: forced });
+    if (end >= total) return new Response(null, { status: 416 });
+
+    const body = new Uint8Array(end - start + 1);
+    for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+    return new Response(body, {
+      status: 206,
+      headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+    });
+  }) as unknown as typeof fetch;
+  return { f, calls };
+}
+
+/** 逐字节生成期望内容。 */
+function expected(total: number): Uint8Array {
+  const b = new Uint8Array(total);
+  for (let i = 0; i < total; i++) b[i] = i % 251;
+  return b;
+}
+
+describe('download', () => {
+  it('完整下载一个整除块大小之外的文件', async () => {
+    const total = 4099;
+    const { f } = rangeServer(total);
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(sink.buf).toEqual(expected(total));
+    expect(sink.closed).toBe(true);
+  });
+
+  it('写入是按偏移定位的，不依赖完成顺序', async () => {
+    const total = 2048;
+    const { f } = rangeServer(total);
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 512, fetchFn: f });
+    expect(sink.writes.length).toBeGreaterThan(0);
+    for (const w of sink.writes) expect(w.position % 512).toBe(0);
+  });
+
+  it('并发覆盖全部区间，无重复抓取', async () => {
+    const total = 4096;
+    const { f, calls } = rangeServer(total);
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(calls).toHaveLength(4);
+    expect(calls.map((c) => c.start).sort((x, y) => x - y)).toEqual([0, 1024, 2048, 3072]);
+  });
+
+  it('分块跨镜像分散（至少用到两个镜像）', async () => {
+    const total = 8192;
+    const { f, calls } = rangeServer(total);
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(new Set(calls.map((c) => c.prefix)).size).toBeGreaterThan(1);
+  });
+
+  it('收到 200（上游忽略 Range）时立即失败，不写入损坏数据', async () => {
+    const total = 1024;
+    const f = (async () => new Response(new Uint8Array(1024), { status: 200 })) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await expect(
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+    ).rejects.toThrow(/200/);
+    expect(sink.aborted).toBe(true);
+    expect(sink.buf).toEqual(new Uint8Array(total));
+  });
+
+  it('Content-Range 与请求区间不符时判为失败', async () => {
+    const total = 1024;
+    const f = (async () =>
+      new Response(new Uint8Array(1024), {
+        status: 206,
+        headers: { 'content-range': `bytes 999-2022/${total}` },
+      })) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await expect(
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+    ).rejects.toThrow(/Content-Range/);
+  });
+
+  it('返回字节数不足时判为失败', async () => {
+    const total = 1024;
+    const f = (async () =>
+      new Response(new Uint8Array(100), {
+        status: 206,
+        headers: { 'content-range': `bytes 0-1023/${total}` },
+      })) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await expect(
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+    ).rejects.toThrow(/字节数不足/);
+  });
+
+  it('单镜像失败后由另一镜像补上', async () => {
+    const total = 2048;
+    const { f } = rangeServer(total, {
+      failOn: (_s, _e, prefix) => (prefix === 'https://a.test/' ? 500 : null),
+    });
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(sink.buf).toEqual(expected(total));
+  });
+
+  it('403 时对半拆分块并重试，最终成功', async () => {
+    const total = 2048;
+    const { f, calls } = rangeServer(total, {
+      // 超过 512 字节的 Range 一律 403，拆到 512 及以下才放行
+      failOn: (s, e) => (e - s + 1 > 512 ? 403 : null),
+    });
+    const sink = new MemSink(total);
+    await download({
+      url: URL_, total, mirrors: MIRRORS, sink, chunkSize: total, fetchFn: f,
+      minChunkSize: 256,
+    });
+    expect(sink.buf).toEqual(expected(total));
+    expect(calls.some((c) => c.end - c.start + 1 < total)).toBe(true);
+  });
+
+  it('拆分到下限仍持续 403 时抛出而非死循环', async () => {
+    const total = 1024;
+    const { f } = rangeServer(total, { failOn: () => 403 });
+    const sink = new MemSink(total);
+    await expect(
+      download({
+        url: URL_, total, mirrors: MIRRORS, sink, chunkSize: total, fetchFn: f,
+        minChunkSize: 256,
+      }),
+    ).rejects.toThrow(/403/);
+    expect(sink.aborted).toBe(true);
+  });
+
+  it('全部镜像持续失败时抛错并 abort sink', async () => {
+    const total = 1024;
+    const f = (async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await expect(
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+    ).rejects.toThrow();
+    expect(sink.aborted).toBe(true);
+  });
+
+  it('报进度：累计字节数单调递增至 total', async () => {
+    const total = 4096;
+    const { f } = rangeServer(total);
+    const sink = new MemSink(total);
+    const seen: number[] = [];
+    await download({
+      url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+      onProgress: (done) => seen.push(done),
+    });
+    expect(seen[seen.length - 1]).toBe(total);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);
+  });
+
+  it('total 为 0 时直接收尾', async () => {
+    const { f } = rangeServer(0);
+    const sink = new MemSink(0);
+    await download({ url: URL_, total: 0, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(sink.closed).toBe(true);
+  });
+
+  it('全部镜像都失败时不再无谓重试（快速失败）', async () => {
+    const total = 1024;
+    let calls = 0;
+    const f = (async () => {
+      calls++;
+      return new Response(null, { status: 500 });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await expect(
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+    ).rejects.toThrow();
+    // 2 个镜像 × 每个最多重试 3 次 = 6，允许拆分带来的额外调用但不该失控
+    expect(calls).toBeLessThanOrEqual(24);
+  });
+});
+
+describe('ChunkError', () => {
+  it('携带 retryable 标记', () => {
+    expect(new ChunkError('x', true).retryable).toBe(true);
+    expect(new ChunkError('x', false).retryable).toBe(false);
+  });
+  it('是 Error 的子类', () => {
+    expect(new ChunkError('x', true)).toBeInstanceOf(Error);
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/engine.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/engine"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/engine.ts`：
+
+```ts
+import { plan, splitChunk } from './planner';
+import type { Chunk, Mirror, Sink } from './types';
+
+/** 单镜像单块的最大重试次数。 */
+export const MAX_SAME_MIRROR_RETRIES = 3;
+
+/** 退避基数（毫秒）。第 n 次重试等待 BASE * 2^n。 */
+export const BACKOFF_BASE_MS = 200;
+
+export class ChunkError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+    this.name = 'ChunkError';
+  }
+}
+
+export interface DownloadOptions {
+  url: string;
+  total: number;
+  mirrors: Mirror[];
+  sink: Sink;
+  chunkSize?: number;
+  fetchFn?: typeof fetch;
+  onProgress?: (bytesDone: number) => void;
+  /** 单块持续失败的硬上限，防止病态重试。 */
+  maxAttemptsPerChunk?: number;
+  /** 403 拆分降级的块大小下限，默认 MIN_CHUNK_SIZE。测试用小值驱动拆分逻辑。 */
+  minChunkSize?: number;
+}
+
+/** 队列暂空但仍有块未完成时，worker 的轮询间隔。 */
+export const SPIN_MS = 10;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 抓取单块并写入 sink。
+ * 严格校验 206 与 Content-Range：上游忽略 Range 返回 200 时若继续写入，
+ * 会把整包内容落到部分文件上，静默产出损坏文件——必须判为失败。
+ */
+async function fetchChunk(
+  mirror: Mirror,
+  url: string,
+  chunk: Chunk,
+  fetchFn: typeof fetch,
+  sink: Sink,
+  onBytes: (n: number) => void,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetchFn(mirror.prefix + url, {
+      headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+    });
+  } catch (e) {
+    throw new ChunkError(`网络错误: ${(e as Error).message}`, true);
+  }
+
+  if (res.status === 403) {
+    throw new ChunkError(`HTTP 403（疑似大 Range 被拒）`, true);
+  }
+  if (res.status === 200) {
+    throw new ChunkError(
+      `HTTP 200：上游忽略了 Range 请求，无法分块下载`,
+      false,
+    );
+  }
+  if (res.status !== 206) {
+    throw new ChunkError(`HTTP ${res.status}`, res.status >= 500);
+  }
+
+  const cr = res.headers.get('content-range');
+  const expectPrefix = `bytes ${chunk.start}-${chunk.end}/`;
+  if (!cr || !cr.startsWith(expectPrefix)) {
+    throw new ChunkError(`Content-Range 不符：期望前缀 "${expectPrefix}"，收到 "${cr}"`, true);
+  }
+
+  if (!res.body) throw new ChunkError('响应没有 body', true);
+
+  const reader = res.body.getReader();
+  let pos = chunk.start;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength > 0) {
+      // 串行 await 写入，且读完即写即弃——不累积，内存与文件大小无关。
+      await sink.write(pos, value);
+      pos += value.byteLength;
+      onBytes(value.byteLength);
+    }
+  }
+
+  if (pos !== chunk.end + 1) {
+    throw new ChunkError(`字节数不足：期望 ${chunk.end + 1 - chunk.start} 字节，实收 ${pos - chunk.start} 字节`, true);
+  }
+}
+
+interface Job {
+  chunk: Chunk;
+  attempts: number;
+}
+
+export async function download(opts: DownloadOptions): Promise<void> {
+  const {
+    url,
+    total,
+    mirrors,
+    sink,
+    chunkSize,
+    fetchFn = fetch,
+    onProgress,
+    maxAttemptsPerChunk = 5,
+    minChunkSize,
+  } = opts;
+
+  let bytesDone = 0;
+  const onBytes = (n: number) => {
+    bytesDone += n;
+    onProgress?.(bytesDone);
+  };
+
+  if (mirrors.length === 0) {
+    await sink.abort();
+    throw new Error('没有可用镜像');
+  }
+
+  // 待办队列。JS 单线程，shift() 天然原子，无需锁。
+  const queue: Job[] = plan(total, chunkSize).map((chunk) => ({ chunk, attempts: 0 }));
+  /** 尚未成功完成的块数。worker 只在它归零时退出——这是坏镜像不拖垮整体的关键。 */
+  let outstanding = queue.length;
+  /** 首个不可恢复的错误。一旦置位，所有 worker 尽快退出。 */
+  let failure: Error | null = null;
+
+  const worker = async (mirror: Mirror): Promise<void> => {
+    while (outstanding > 0 && !failure) {
+      const job = queue.shift();
+      if (!job) {
+        // 队列暂空但仍有块未完成（正被别的 worker 持有），短暂轮询等待。
+        await sleep(SPIN_MS);
+        continue;
+      }
+
+      try {
+        await fetchChunk(mirror, url, job.chunk, fetchFn, sink, onBytes);
+        outstanding--;
+      } catch (e) {
+        const err = e instanceof ChunkError ? e : new ChunkError(String(e), true);
+
+        // 不可重试（如上游忽略 Range 返回 200）→ 全局放弃。
+        // 此时继续写会产出损坏文件，绝不能容忍。
+        if (!err.retryable) {
+          failure = err;
+          return;
+        }
+
+        job.attempts++;
+
+        // 403 优先走「对半拆分」降级：把 Range 缩小再试
+        if (/403/.test(err.message)) {
+          const halves = splitChunk(job.chunk, minChunkSize);
+          if (halves) {
+            queue.push({ chunk: halves[0], attempts: 0 }, { chunk: halves[1], attempts: 0 });
+            outstanding++; // 一块变两块
+            continue;
+          }
+        }
+
+        if (job.attempts >= maxAttemptsPerChunk) {
+          failure = err;
+          return;
+        }
+
+        // 放回队尾让其他健康镜像接手。本 worker 随即退避，而空闲的对等 worker
+        // 每 SPIN_MS 轮询一次队列，因此健康镜像总能先抢到该块。
+        queue.push(job);
+        await sleep(BACKOFF_BASE_MS * 2 ** (job.attempts - 1));
+      }
+    }
+  };
+
+  try {
+    await Promise.all(mirrors.map(worker));
+    if (failure) throw failure;
+    if (outstanding > 0) throw new Error(`下载未完成，仍有 ${outstanding} 个分块未获取`);
+    await sink.close();
+  } catch (e) {
+    await sink.abort();
+    throw e;
+  }
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/engine.test.ts
+```
+
+预期：16 passed。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd "D:/github_download++" && git add src/engine.ts tests/engine.test.ts && git commit -m "feat: 多镜像 work-stealing 下载调度核心"
+```
+
+---
+
+### Task 8: `sink.ts` 落盘实现
+
+**Files:**
+- Create: `src/sink.ts`
+- Test: `tests/sink.test.ts`
+
+**Interfaces:**
+- Consumes: `src/types.ts` 的 `Sink`
+- Produces: `createFsaSink(suggestedName: string): Promise<Sink>`、`class UnsupportedBrowserError extends Error`、`supportsFsa(): boolean`
+
+**设计要点：** 本模块只做浏览器 API 的薄封装与能力检测，逻辑极少，故用 mock 的 `window` 测试检测分支，真实写入行为已在 Task 1 spike 中验证。
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `tests/sink.test.ts`：
+
+```ts
+import { describe, it, expect, vi } from 'vitest';
+import { supportsFsa, createFsaSink, UnsupportedBrowserError } from '../src/sink';
+
+describe('supportsFsa', () => {
+  it('showSaveFilePicker 与 createWritable 同时存在时为 true', () => {
+    const stream = { createWritable: vi.fn() };
+    expect(supportsFsa({ showSaveFilePicker: vi.fn(), FileSystemFileHandle: { prototype: stream } } as never)).toBe(true);
+  });
+
+  it('showSaveFilePicker 缺失时为 false', () => {
+    expect(supportsFsa({} as never)).toBe(false);
+  });
+
+  it('仅有 showSaveFilePicker 而 createWritable 缺失时为 false（iOS Firefox 的情况）', () => {
+    expect(supportsFsa({ showSaveFilePicker: vi.fn() } as never)).toBe(false);
+  });
+});
+
+describe('createFsaSink', () => {
+  it('不支持时抛 UnsupportedBrowserError', async () => {
+    await expect(createFsaSink('a.bin', {} as never)).rejects.toBeInstanceOf(UnsupportedBrowserError);
+  });
+
+  it('调用 showSaveFilePicker 并传入 suggestedName', async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const abort = vi.fn().mockResolvedValue(undefined);
+    const showSaveFilePicker = vi.fn().mockResolvedValue({
+      createWritable: vi.fn().mockResolvedValue({ write, close, abort }),
+    });
+    const win = {
+      showSaveFilePicker,
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+
+    const sink = await createFsaSink('a.bin', win);
+    expect(showSaveFilePicker).toHaveBeenCalledWith({ suggestedName: 'a.bin' });
+
+    await sink.write(100, new Uint8Array([1, 2, 3]));
+    expect(write).toHaveBeenCalledWith({ type: 'write', position: 100, data: new Uint8Array([1, 2, 3]) });
+
+    await sink.close();
+    expect(close).toHaveBeenCalled();
+  });
+
+  it('createWritable 不得传 keepExistingData', async () => {
+    const createWritable = vi.fn().mockResolvedValue({
+      write: vi.fn(), close: vi.fn(), abort: vi.fn(),
+    });
+    const win = {
+      showSaveFilePicker: vi.fn().mockResolvedValue({ createWritable }),
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+    await createFsaSink('a.bin', win);
+    expect(createWritable).toHaveBeenCalledWith();
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/sink.test.ts
+```
+
+预期：FAIL，报 `Failed to resolve import "../src/sink"`。
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `src/sink.ts`：
+
+```ts
+import type { Sink } from './types';
+
+export class UnsupportedBrowserError extends Error {
+  constructor() {
+    super('当前浏览器不支持 File System Access API（请使用 Chrome / Edge / Opera）');
+    this.name = 'UnsupportedBrowserError';
+  }
+}
+
+/**
+ * 能力检测必须同时检查 createWritable——iOS 上的 Firefox 会暴露
+ * showSaveFilePicker 却没有 createWritable。
+ */
+export function supportsFsa(win: unknown = globalThis): boolean {
+  const w = win as Record<string, unknown>;
+  if (typeof w.showSaveFilePicker !== 'function') return false;
+  const proto = (w.FileSystemFileHandle as { prototype?: Record<string, unknown> } | undefined)?.prototype;
+  return typeof proto?.createWritable === 'function';
+}
+
+/** 把 FSA 的流包成 Sink。不做任何缓冲——直接透传定位写入。 */
+function wrap(stream: {
+  write(d: { type: 'write'; position: number; data: Uint8Array }): Promise<void>;
+  close(): Promise<void>;
+  abort?(): Promise<void>;
+}): Sink {
+  return {
+    write: (position, data) => stream.write({ type: 'write', position, data }),
+    close: () => stream.close(),
+    abort: async () => {
+      await (stream.abort?.() ?? stream.close());
+    },
+  };
+}
+
+export async function createFsaSink(suggestedName: string, win: unknown = globalThis): Promise<Sink> {
+  if (!supportsFsa(win)) throw new UnsupportedBrowserError();
+  const w = win as {
+    showSaveFilePicker(o: { suggestedName: string }): Promise<{
+      createWritable(): Promise<Parameters<typeof wrap>[0]>;
+    }>;
+  };
+  const handle = await w.showSaveFilePicker({ suggestedName });
+  // 刻意不传 keepExistingData：传 true 会先整份复制现有文件，对大文件是一次完整拷贝。
+  const stream = await handle.createWritable();
+  return wrap(stream);
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd "D:/github_download++" && npx vitest run tests/sink.test.ts
+```
+
+预期：6 passed。
+
+- [ ] **Step 5: 全量测试 + 类型检查 + 提交**
+
+```bash
+cd "D:/github_download++" && npm run typecheck && npm test && git add src/sink.ts tests/sink.test.ts && git commit -m "feat: FSA 落盘 sink 与浏览器能力检测"
+```
+
+---
+
+### Task 9: 界面与端到端串联
+
+**Files:**
+- Create: `index.html`
+- Create: `src/main.ts`
+- Create: `src/ui.ts`
+
+**Interfaces:**
+- Consumes: `resolver.parseReleaseUrl` / `resolveMetadata`、`mirrors.MirrorPool`、`probe.probeMirrors`、`engine.download`、`sink.createFsaSink` / `supportsFsa`
+- Produces: 可用的单页应用
+
+- [ ] **Step 1: 写页面骨架**
+
+创建 `index.html`：
+
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Release 加速下载</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 system-ui, sans-serif; max-width: 780px; margin: 40px auto; padding: 0 20px; }
+  input[type=url] { width: 100%; padding: 10px; font-size: 14px; box-sizing: border-box; }
+  button { padding: 10px 22px; font-size: 15px; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: .5; }
+  #bar { height: 22px; background: #8883; border-radius: 4px; overflow: hidden; margin: 14px 0 6px; }
+  #fill { height: 100%; width: 0; background: #3b82f6; transition: width .15s; }
+  #stats { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; color: #888; max-height: 190px; overflow: auto; }
+  .err { color: #dc2626; }
+  #warn { padding: 10px; border: 1px solid #f59e0b; border-radius: 4px; margin-bottom: 14px; display: none; }
+</style>
+</head>
+<body>
+  <h1>GitHub Release 加速下载</h1>
+  <div id="warn"></div>
+  <p><input type="url" id="url" placeholder="https://github.com/owner/repo/releases/download/tag/file.exe" autocomplete="off"></p>
+  <p><button id="go">开始下载</button> <span id="hint"></span></p>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stats"><span id="pct">—</span><span id="spd"></span><span id="eta"></span></div>
+  <div id="mirrors"></div>
+  <div id="log"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+```
+
+- [ ] **Step 2: 写视图辅助**
+
+创建 `src/ui.ts`：
+
+```ts
+import type { ProbeResult } from './types';
+
+const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
+
+export const els = {
+  url: $<HTMLInputElement>('url'),
+  go: $<HTMLButtonElement>('go'),
+  hint: $<HTMLSpanElement>('hint'),
+  fill: $<HTMLDivElement>('fill'),
+  pct: $<HTMLSpanElement>('pct'),
+  spd: $<HTMLSpanElement>('spd'),
+  eta: $<HTMLSpanElement>('eta'),
+  mirrors: $<HTMLDivElement>('mirrors'),
+  log: $<HTMLDivElement>('log'),
+  warn: $<HTMLDivElement>('warn'),
+};
+
+export function showWarning(msg: string): void {
+  els.warn.textContent = msg;
+  els.warn.style.display = 'block';
+}
+
+export function log(msg: string, isError = false): void {
+  const line = document.createElement('div');
+  if (isError) line.className = 'err';
+  line.textContent = msg;
+  els.log.appendChild(line);
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+export function setProgress(done: number, total: number): void {
+  const pct = total > 0 ? (done / total) * 100 : 0;
+  els.fill.style.width = `${pct.toFixed(1)}%`;
+  els.pct.textContent = `${pct.toFixed(1)}%  ${fmtBytes(done)} / ${fmtBytes(total)}`;
+}
+
+export function setSpeed(bytesPerSec: number, done: number, total: number): void {
+  els.spd.textContent = `${fmtBytes(bytesPerSec)}/s`;
+  if (bytesPerSec > 0 && total > done) {
+    const s = (total - done) / bytesPerSec;
+    els.eta.textContent = `剩余 ${s < 60 ? `${s.toFixed(0)} 秒` : `${(s / 60).toFixed(1)} 分`}`;
+  }
+}
+
+export function fmtBytes(n: number): string {
+  if (!Number.isFinite(n)) return '—';
+  const u = ['B', 'KiB', 'MiB', 'GiB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i === 0 ? 0 : 2)} ${u[i]}`;
+}
+
+export function renderMirrors(results: ProbeResult[]): void {
+  if (results.length === 0) { els.mirrors.textContent = ''; return; }
+  const rows = results
+    .map(
+      (r) =>
+        `<tr><td>${r.mirror.id}</td><td>${r.ok ? '可用' : '<span class="err">不可用</span>'}</td>` +
+        `<td class="num">${r.ok ? `${fmtBytes(r.bytesPerSec)}/s` : '—'}</td>` +
+        `<td class="num">${r.ttfbMs} ms</td></tr>`,
+    )
+    .join('');
+  els.mirrors.innerHTML =
+    `<table><thead><tr><th>镜像</th><th>状态</th><th class="num">吞吐</th><th class="num">首字节</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+export function setBusy(busy: boolean): void {
+  els.go.disabled = busy;
+  els.go.textContent = busy ? '下载中…' : '开始下载';
+}
+```
+
+- [ ] **Step 3: 串联主流程**
+
+创建 `src/main.ts`：
+
+```ts
+import { parseReleaseUrl, resolveMetadata } from './resolver';
+import { MirrorPool } from './mirrors';
+import { probeMirrors } from './probe';
+import { download } from './engine';
+import { createFsaSink, supportsFsa, UnsupportedBrowserError } from './sink';
+import type { Sink } from './types';
+import * as ui from './ui';
+
+/** 单连接回退：整体下载后用 <a download> 保存。无并行、无断点，仅保可用性。 */
+async function fallbackDownload(url: string, mirrorPrefix: string, filename: string): Promise<void> {
+  ui.log('使用单连接回退模式（无并行加速）…');
+  const res = await fetch(mirrorPrefix + url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(href);
+}
+
+async function run(): Promise<void> {
+  const raw = ui.els.url.value.trim();
+  ui.els.log.textContent = '';
+  ui.setProgress(0, 1);
+
+  const ref = parseReleaseUrl(raw);
+  ui.log(`仓库 ${ref.owner}/${ref.repo}  标签 ${ref.tag}`);
+
+  const pool = new MirrorPool();
+  const mirrors = pool.available();
+
+  ui.log(`探测 ${mirrors.length} 个镜像…`);
+  const probes = await probeMirrors(raw, mirrors);
+  ui.renderMirrors(probes);
+
+  for (const p of probes) {
+    if (p.ok) pool.recordSuccess(p.mirror.id, p.bytesPerSec);
+    else pool.recordFailure(p.mirror.id);
+  }
+  const usable = probes.filter((p) => p.ok).map((p) => p.mirror);
+  if (usable.length === 0) throw new Error('全部镜像均不可用，请稍后重试');
+
+  const best = usable[0];
+  const meta = await resolveMetadata(raw, best.prefix);
+  ui.log(`文件 ${meta.filename}  大小 ${ui.fmtBytes(meta.total)}`);
+
+  let sink: Sink;
+  if (supportsFsa()) {
+    sink = await createFsaSink(meta.filename);
+  } else {
+    ui.showWarning('当前浏览器不支持 File System Access API，将使用单连接回退模式。建议改用 Chrome / Edge。');
+    await fallbackDownload(raw, best.prefix, meta.filename);
+    ui.log('已触发保存。');
+    return;
+  }
+
+  if (!meta.acceptRanges) {
+    ui.log('上游不支持 Range，降级为单连接下载…');
+    await sink.abort();
+    await fallbackDownload(raw, best.prefix, meta.filename);
+    return;
+  }
+
+  const t0 = Date.now();
+  let lastBytes = 0;
+  let lastT = t0;
+
+  await download({
+    url: raw,
+    total: meta.total,
+    mirrors: usable,
+    sink,
+    onProgress: (done) => {
+      ui.setProgress(done, meta.total);
+      const now = Date.now();
+      if (now - lastT >= 400) {
+        ui.setSpeed(((done - lastBytes) / (now - lastT)) * 1000, done, meta.total);
+        lastBytes = done;
+        lastT = now;
+      }
+    },
+  });
+
+  const secs = (Date.now() - t0) / 1000;
+  ui.setProgress(meta.total, meta.total);
+  ui.setSpeed(meta.total / secs, meta.total, meta.total);
+  ui.log(`完成：${ui.fmtBytes(meta.total)} 用时 ${secs.toFixed(1)}s，平均 ${ui.fmtBytes(meta.total / secs)}/s`);
+}
+
+ui.els.go.addEventListener('click', async () => {
+  ui.setBusy(true);
+  ui.els.hint.textContent = '';
+  try {
+    await run();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    ui.log(`失败：${msg}`, true);
+    ui.els.hint.textContent = e instanceof UnsupportedBrowserError ? '请改用 Chrome / Edge' : '下载失败，请查看日志';
+  } finally {
+    ui.setBusy(false);
+  }
+});
+
+if (!supportsFsa()) {
+  ui.showWarning('检测到当前浏览器不支持 File System Access API（Firefox / Safari 均不支持）。功能将受限为单连接回退模式，建议改用 Chrome / Edge。');
+}
+```
+
+- [ ] **Step 4: 构建与类型检查**
+
+```bash
+cd "D:/github_download++" && npm run typecheck && npm run build
+```
+
+预期：typecheck 无错，`dist/` 生成。
+
+- [ ] **Step 5: 真实端到端验证**
+
+先用一个**小文件**做快速冒烟（迭代快、不浪费带宽），再用大文件做验收。
+
+小文件：任选一个已知的、体积 < 5 MB 的 GitHub Release 资产链接。
+**本计划不提供具体小文件 URL，因为我未验证过任何一个仍然有效**——请自行从任意仓库的 Releases 页面取一个。
+下载完成后用 `certutil -hashfile <文件> SHA256` 与页面显示的大小核对。
+
+```bash
+cd "D:/github_download++" && npm run dev
+```
+
+浏览器打开 Vite 提示的地址，粘贴验收链接：
+
+```
+https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe
+```
+
+预期：镜像面板显示 4 个镜像状态与吞吐 → 保存对话框弹出 → 进度条推进、速度与 ETA 更新 → 完成后文件大小精确等于 `499558899` 字节。
+
+校验：
+
+```bash
+certutil -hashfile "下载到的文件" SHA256
+```
+
+与 Task 1 spike 得到的哈希比对，必须一致。
+
+- [ ] **Step 6: 提交**
+
+```bash
+cd "D:/github_download++" && git add -A && git commit -m "feat: 单页界面与端到端串联"
+```
+
+---
+
+### Task 10: 部署到 GitHub Pages
+
+**Files:**
+- Create: `.github/workflows/deploy.yml`
+- Modify: `vite.config.ts`（增加 `base`）
+
+**Interfaces:**
+- Consumes: Task 9 产出的 `dist/`
+- Produces: 一个可访问的线上地址
+
+**注意：** GitHub Pages 是 HTTPS，`showSaveFilePicker` 需要安全上下文，Pages 满足。仓库必须是 Public，或账号有 Pages 私有仓库权限。
+
+- [ ] **Step 1: 配置 base 路径**
+
+修改 `vite.config.ts`，加入 `base`。把 `<仓库名>` 替换为实际仓库名（**GitHub 仓库名不允许 `+` 字符**，故不能用 `github_download++`）：
+
+```ts
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  root: '.',
+  base: '/<仓库名>/',
+  build: { outDir: 'dist' },
+  test: { globals: true, environment: 'node' },
+});
+```
+
+- [ ] **Step 2: 写部署工作流**
+
+创建 `.github/workflows/deploy.yml`：
+
+```yaml
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+- [ ] **Step 3: 提交并推送**
+
+```bash
+cd "D:/github_download++" && git add -A && git commit -m "ci: GitHub Pages 自动部署"
+```
+
+推送：
+
+```bash
+cd "D:/github_download++" && git push -u origin main
+```
+
+- [ ] **Step 4: 在仓库设置中启用 Pages**
+
+用户需手动操作：仓库 → Settings → Pages → Source 选 **GitHub Actions**。
+
+- [ ] **Step 5: 验证线上可用**
+
+等 Actions 跑完，打开 `https://<用户名>.github.io/<仓库名>/`，用 Task 9 的同一条链接重跑一次，确认功能与本地一致。
+
+---
+
+## 附录：验收清单
+
+- [ ] `npm run typecheck` 无错
+- [ ] `npm test` 全绿（预计 60 个用例）
+- [ ] Task 1 spike 通过（架构闸门）
+- [ ] 499558899 字节文件下载完成，大小精确匹配，SHA-256 与参照一致
+- [ ] 速度显著优于 0.06 MB/s 直连基线
+- [ ] 镜像面板正确显示 4 个镜像的状态
+- [ ] 手动让某镜像失败，验证 work-stealing 与降级生效
+- [ ] Firefox 下显示单连接回退提示且不崩溃
+- [ ] 线上 Pages 地址可用
