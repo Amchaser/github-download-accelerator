@@ -870,8 +870,11 @@ describe('splitChunk', () => {
       { index: 1, start: 512, end: 1023 },
     ]);
     // len === minChunkSize * 2 必须仍可拆成两个「恰好等于下限」的块——这是
-    // 「降到下限 1 MB 仍失败才转单连接」的必要条件。若把实现里的 `<` 改成 `<=`，
+    // 「拆到下限 1 MB 仍失败即判硬失败」的必要条件。若把实现里的 `<` 改成 `<=`，
     // 下限会实际退化为 2 倍，永远拆不到 1 MB。
+    // 注意实际行为：降到下限仍失败时引擎**直接抛错**（splitChunk 返回 null → 尝试预算
+    // 耗尽 → 全局失败），**不会**转成单连接顺序下载——fallbackDownload 只从 main.ts 的
+    // `acceptRanges === false` 分支进入，与本降级路径无关。
     expect(splitChunk({ index: 0, start: 0, end: 511 }, 256)).toEqual([
       { index: 0, start: 0, end: 255 },
       { index: 1, start: 256, end: 511 },
@@ -3018,7 +3021,7 @@ cd "D:/github_download++" && git push -u origin main
 ## 附录：验收清单
 
 - [ ] `npm run typecheck` 无错
-- [ ] `npm test` 全绿（预计 60 个用例）
+- [ ] `npm test` 全绿（84 个用例）
 - [ ] Task 1 spike 通过（架构闸门）
 - [ ] 499558899 字节文件下载完成，大小精确匹配，SHA-256 与参照一致
 - [ ] 速度显著优于 0.06 MB/s 直连基线
