@@ -14,7 +14,10 @@
 - **默认块大小 8 MiB**（`8 * 1024 * 1024`）。块大小下限 1 MiB。
 - **永远通过原始 GitHub URL 发起请求**：`mirrorPrefix + originalUrl`，让镜像每次自行 follow 302。302 落点是限时签名 URL，禁止缓存。
 - **任何 Range 响应必须校验 `status === 206` 且 `Content-Range` 前缀等于 `bytes ${start}-${end}/`**。收到 `200` 表示上游忽略 Range，此时把整包写入部分文件会静默产出损坏文件——必须判定为失败。
-- **禁止对响应体调用 `.blob()` / `.arrayBuffer()`**。只允许 `body.getReader()` 流式读取，读到即写即弃。
+- **下载热路径禁止对响应体整块缓冲**：`engine.ts` 读取 Range 响应体必须用 `body.getReader()` 流式读取、读到即写即弃，**不得调用 `.blob()` / `.arrayBuffer()`**。目的：保证内存占用不随文件大小增长（4 路并发 × 大块）。
+  **两处明列豁免，不视为违反本条：**
+  1. `probe.ts` 的镜像探针 —— 体量固定 512 KiB，与目标文件大小无关。
+  2. `main.ts` 的单连接回退 `fallbackDownload` —— 该路径没有定位写入能力，不整块进内存就无法保存；它是「明知慢但保可用」的降级路径，不参与并行热路径。
 - **`sink.write()` 必须 `await` 串行化**，不得并发调用。
 - **`createWritable()` 不得传 `keepExistingData: true`**。
 - **能力检测必须检测 `createWritable`**，而非仅检测 `showSaveFilePicker`。
