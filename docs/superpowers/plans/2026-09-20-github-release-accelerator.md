@@ -63,28 +63,38 @@ const HAS_MEM = typeof performance !== 'undefined' && !!performance.memory;
 // 无 performance.memory 时一律打印 N/A。打印 0MiB 会被读成「内存极好」——那是假 PASS。
 const fmtHeap = (bytes) => HAS_MEM ? `${(bytes / 1048576).toFixed(0)}MiB` : 'N/A';
 
-// 归因只看失败消息的文本，不看阶段前缀：[下载] 里同时装着「写入 / 区块完整性」与
-// 「纯镜像请求失败」两类，按前缀判断会把一次镜像退化误判成架构不成立。
+// 归因只看失败消息的文本，不看阶段前缀：[下载] 里同时装着「写入失败」与
+// 「纯镜像请求失败（含忽略 Range 回 200 / Content-Range 失配 / 流被截断）」两类，
+// 按前缀判断会把一次镜像退化误判成架构不成立。
+// 写入桶只收「写入失败」（已覆盖较新的「写入失败或停滞」标签）：期望 206 / Content-Range / 截断
+// 全是读侧、镜像侧的缺陷，与 stream.write 没有因果关系。把它们算进写入桶能直接否决整个架构：
+// gh.xmly.dev 既是探针镜像（MIRRORS[0]），也是 WORKERS=1 时唯一使用的镜像；它中途退化时
+// 会被判成写入问题 → 页面建议用 WORKERS=1 重跑 → 重跑用的还是同一个坏镜像 → 再失败 →
+// 于是把一次瞬时镜像故障读成「定位写入本身不被支持，架构不成立」。截断尤其不能收进来：
+// 流被截断不构成任何关于「定位写入是否可行」的证据。
 // 注意顺序：[探针] 分支必须最先判——探针的 Content-Range 失配消息里也带着 "Content-Range"，
-// 否则会被下面的写入类正则捞走，把「镜像不遵守 Range」误导成「并发写有问题」。
+// 否则会被下面的镜像类正则捞走（好在那也归镜像桶，但结论话术不同，必须在探针分支里说清）。
 const PROBE_FAIL_RE = /\[探针\]/;
 const FINALIZE_FAIL_RE = /\[收尾\]/;
-const WRITE_FAIL_RE = /写入失败|期望 206|Content-Range|截断/;
-const MIRROR_FAIL_RE = /请求失败\/超时|流中断\/超时/;
+const WRITE_FAIL_RE = /写入失败/;
+const MIRROR_FAIL_RE = /请求失败\/超时|流中断\/超时|期望 206|Content-Range|截断/;
 function logFailureAttribution(msg) {
   const m = String(msg == null ? '' : msg);
   if (PROBE_FAIL_RE.test(m)) {
     log('[并发归因] 失败在探针阶段 —— 这是镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西。');
-    log('[并发归因] 换一个可用镜像重跑；不要用 WORKERS=1 归因（它换的是并发度，换不掉一个坏镜像）。');
+    log('[并发归因] 把另一个白名单镜像调到 MIRRORS 数组首位后原样重跑（探针硬编码 MIRRORS[0]，只改数组顺序、不换白名单外的镜像）；');
+    log('[并发归因] 不要用 WORKERS=1 归因（它换的是并发度，换不掉一个坏镜像，而且照样只用 MIRRORS[0]）。');
   } else if (FINALIZE_FAIL_RE.test(m)) {
     log('[并发归因] 失败发生在收尾（close / 读取落盘文件大小），不是镜像问题；常见原因是磁盘空间不足或落盘失败。');
     log('[并发归因] 先确认目标盘剩余空间后原样重跑；不要用 WORKERS=1 归因——它改的是并发，与收尾无关。');
   } else if (WRITE_FAIL_RE.test(m)) {
-    log(`[并发归因] 失败消息指向写入 / 区块完整性 ⇒ 把脚本顶部的 WORKERS 改成 1 后原样重跑（其余步骤不变）：`);
+    log('[并发归因] 失败消息指向写入本身（stream.write 被拒绝，或写入停滞超时）⇒ 把脚本顶部的 WORKERS 改成 1 后原样重跑（其余步骤不变）：');
     log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
     log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+    log('[并发归因] 这条「架构不成立」的结论只对写入失败成立：期望 206 / Content-Range / 截断 属镜像侧缺陷，已归入镜像分支，不得据此判定架构不成立。');
   } else if (MIRROR_FAIL_RE.test(m)) {
-    log('[并发归因] 失败消息指向某个镜像的请求 / 流问题，与写入无关 ⇒ 该镜像可疑，请换用另一个镜像重跑。');
+    log('[并发归因] 失败消息指向某个镜像的请求 / 流问题（忽略 Range 回 200、Content-Range 失配、流被截断、请求 / 流超时），与写入无关 ⇒ 该镜像可疑。');
+    log('[并发归因] 动作：把可疑镜像移到 MIRRORS 数组首位后原样重跑（探针硬编码 MIRRORS[0]，WORKERS=1 也只解析到 MIRRORS[0]，所以换镜像只能靠改数组顺序）；只用白名单里那 4 个镜像，不要替换成白名单外的。');
     log('[并发归因] 此时不要改成 WORKERS=1：WORKERS=1 只用 MIRRORS[0]，会静默丢掉故障镜像而「成功」，把镜像退化误读成并发问题。');
   } else {
     log('[并发归因] 失败消息既不像写入问题、也不像镜像请求问题 ⇒ 不得用 WORKERS=1 捷径下结论，先单独复现并记下完整消息。');
@@ -106,7 +116,7 @@ document.getElementById('go').onclick = async () => {
   // 并发归因只在失败时、且按失败消息的文本给出（见 logFailureAttribution）。
   // 在这里先交代判读口径，避免事后读日志的人不知道该怎么归因。
   log('[并发归因] 若失败，归因只看失败消息的文本，不看阶段前缀：[探针] ⇒ 镜像 / 网络问题，本轮无效；[收尾] ⇒ close / 落盘问题；');
-  log('[并发归因] 含「写入失败 / 期望 206 / Content-Range / 截断」⇒ 区块完整性或写入问题（可做 WORKERS=1 归因）；含「请求失败/超时 / 流中断/超时」⇒ 该镜像的请求 / 流问题，换一个镜像重跑，不要用 WORKERS=1 捷径。');
+  log('[并发归因] 含「写入失败」⇒ stream.write 本身的问题（可做 WORKERS=1 归因）；含「请求失败/超时 / 流中断/超时 / 期望 206 / Content-Range / 截断」⇒ 该镜像的请求 / 流问题，与写入无关：把可疑镜像调到 MIRRORS 数组首位（探针与 WORKERS=1 都只看 MIRRORS[0]）后原样重跑，不要用 WORKERS=1 捷径。');
 
   // 特性预检：非 Chromium / 非安全上下文时应报「环境不支持」，
   // 而不是抛 TypeError 之后再补一句 SecurityError 的提示，把不支持的环境带进重试死循环。
@@ -132,6 +142,16 @@ document.getElementById('go').onclick = async () => {
   let stream;
   let heapTimer;            // 声明在 try 之外，catch 里才能 clearInterval
   let aborted = false;      // 声明在 try 之外，catch 里置位，让其余 worker 立即停手
+  // peakHeap / sampleHeap 也必须声明在 try 之外：失败路径同样要报出峰值堆。
+  // [收尾] 失败（close 时才落盘、磁盘满时报错）恰恰是「关闭时才落盘」的峰值所在，
+  // 那一次运行最需要这个数字；采样函数若定义在 try 内，catch 里引用会直接 ReferenceError，
+  // 连失败消息本身都打不出来。它们都在 onclick 回调体里，每次点击重新初始化，不跨次累积。
+  let peakHeap = 0;
+  const sampleHeap = () => {
+    if (!HAS_MEM) return;
+    const h = performance.memory.usedJSHeapSize;
+    if (Number.isFinite(h) && h > 0) peakHeap = Math.max(peakHeap, h);
+  };
   const inflight = new Set(); // 在途请求的 AbortController，失败时统一取消
   try {
     handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
@@ -165,14 +185,9 @@ document.getElementById('go').onclick = async () => {
     log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
 
     const t0 = performance.now();
-    let done = 0, peakHeap = 0;
-    // 独立定时采样峰值堆。只在分块边界采样会漏掉块内瞬时累积，
-    // 而「堆是否随下载字节数线性增长」正是本 spike 的判定标准之一。
-    const sampleHeap = () => {
-      if (!HAS_MEM) return;
-      const h = performance.memory.usedJSHeapSize;
-      if (Number.isFinite(h) && h > 0) peakHeap = Math.max(peakHeap, h);
-    };
+    let done = 0;
+    // 独立定时采样峰值堆（采样函数定义在 try 之外，catch 里也要用它，见上）。
+    // 只在分块边界采样会漏掉块内瞬时累积，而「堆是否随下载字节数线性增长」正是本 spike 的判定标准之一。
     heapTimer = setInterval(sampleHeap, 100);
     sampleHeap();
 
@@ -289,16 +304,21 @@ document.getElementById('go').onclick = async () => {
     } catch (e) {
       throw new Error(`[收尾] 大小校验读取失败: ${e && e.name} ${e && e.message}`);
     }
-    log(written === total
-      ? `[大小校验] PASS: 落盘文件 ${written} 字节 === total ${total}`
-      : `[大小校验] FAIL: 落盘文件 ${written} 字节 !== total ${total}`);
-    log('[大小校验] 注意: 本条只证明长度正确，不证明内容正确——长度正确但内容错位同样会 PASS。');
+    if (written === total) {
+      log(`[大小校验] PASS: 落盘文件 ${written} 字节 === total ${total}`);
+      // 这句只在 PASS 分支打印：FAIL 时紧跟一句「长度正确但内容可能错位」是自相矛盾的，
+      // 而且恰好出现在读者正要下判定的那一刻。
+      log('[大小校验] 注意: 本条只证明长度正确，不证明内容正确——长度正确但内容错位同样会 PASS。');
+    } else {
+      log(`[大小校验] FAIL: 落盘文件 ${written} 字节 !== total ${total}（大小不符即不通过，无需再比哈希）。`);
+    }
   } catch (e) {
     aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
+    sampleHeap();                          // 失败前最后采一次，让下面的 peak 覆盖到失败时刻
     clearInterval(heapTimer);
     for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
-    log(`失败: ${e && e.message}`);
+    log(`失败: ${e && e.message}  peak=${fmtHeap(peakHeap)}`);
     logFailureAttribution(e && e.message);
   }
 };
@@ -371,16 +391,22 @@ stat -c '%s' "下载到的文件路径"     # MSYS / Git Bash
 ```
 
 **若失败，必须做并发归因，否则结论不可用。** 归因**按失败消息的文本判断，不按阶段前缀判断**——
-`[下载]` 里既有写入 / 区块完整性问题，也有纯镜像请求失败：
+`[下载]` 里既有写入本身的问题，也有纯镜像请求失败（忽略 Range 回 200 / `Content-Range` 失配 / 流被截断）：
 
 | 失败消息里出现 | 含义 | 下一步 |
 | --- | --- | --- |
-| `期望 206` / `Content-Range` / `截断` / `写入失败` | 区块完整性或写入问题（与镜像无关） | 可做 `WORKERS=1` 归因（见下） |
-| `请求失败/超时` / `流中断/超时` | 该镜像的请求 / 流问题 | **换一个镜像**重跑，不要用 `WORKERS=1` |
-| `[探针]` | 镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西 | 换一个可用镜像重跑 |
+| `写入失败` | 定位写入本身失败（`stream.write` 被拒绝，或写入停滞超时） | 可做 `WORKERS=1` 归因（见下） |
+| `期望 206` / `Content-Range` / `截断` / `请求失败/超时` / `流中断/超时` | **该镜像**的请求 / 流缺陷（忽略 Range 回 200、响应头失配、流被截断、超时）——与写入无关 | **换镜像**重跑：把可疑镜像调到 `MIRRORS` 数组首位（探针硬编码 `MIRRORS[0]`，`WORKERS=1` 也只解析到 `MIRRORS[0]`），不要用 `WORKERS=1` |
+| `[探针]` | 镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西 | 换一个可用镜像重跑：把另一个白名单镜像调到 `MIRRORS` 数组首位 |
 | `[收尾]` | `close()` / 读取落盘大小失败，常见于磁盘空间不足 | 确认目标盘空间后原样重跑 |
 
-**只有**失败消息指向写入或区块完整性时，才把 `spike/fsa-parallel.html` 顶部的
+**`期望 206` / `Content-Range` / `截断` 全部是读侧、镜像侧的缺陷，与写入没有因果关系**，
+因此**不在**写入桶里：把它们算成写入问题会直接否决整个架构——`gh.xmly.dev` 既是探针镜像（`MIRRORS[0]`），
+也是 `WORKERS=1` 时唯一使用的镜像；它中途退化时会被判成写入问题 → 页面建议 `WORKERS=1` 重跑 →
+重跑用的还是同一个坏镜像 → 再失败 → 于是把一次瞬时镜像故障读成「定位写入本身不被支持，架构不成立」。
+`截断` 尤其不能算作写入问题：流被截断不构成任何关于「定位写入是否可行」的证据。
+
+**只有**失败消息指向写入本身（`写入失败`）时，才把 `spike/fsa-parallel.html` 顶部的
 `const WORKERS = 4;` 改成 `1` 后原样重跑：
 
 - `WORKERS=1` **成功** ⇒ 定位写入本身可行，问题只在「并发写未串行化」（spike 里每个 worker 各自
@@ -388,9 +414,13 @@ stat -c '%s' "下载到的文件路径"     # MSYS / Git Bash
   **这不算本任务不通过**。
 - `WORKERS=1` **仍失败** ⇒ 定位写入本身不被支持，架构不成立，本任务不通过。
 
-**若失败消息指向镜像请求 / 流问题，绝不要用 `WORKERS=1` 归因。** `WORKERS=1` 只使用 `MIRRORS[0]`，
-会把故障镜像静默丢掉，于是重跑可能「成功」——那只说明那个镜像坏，不说明并发有问题。
-这种情况的正确动作是换一个镜像重跑。
+**若失败消息指向镜像请求 / 流问题（含 `期望 206` / `Content-Range` / `截断`），绝不要用 `WORKERS=1` 归因。**
+`WORKERS=1` 只使用 `MIRRORS[0]`，会把故障镜像静默丢掉，于是重跑可能「成功」——那只说明那个镜像坏，
+不说明并发有问题。这种情况的正确动作是换一个镜像重跑。
+
+**「换一个镜像」的具体做法是调整 `MIRRORS` 数组顺序，而不是换别的镜像站。** 镜像白名单固定为那 4 个
+（见 Global Constraints），不得引入白名单外的镜像；而探针硬编码 `MIRRORS[0]`、`WORKERS=1` 也只解析到
+`MIRRORS[0]`，所以「让另一个镜像起作用」的唯一可执行动作就是把它挪到数组首位后原样重跑。
 
 两种结果都要写进结论，因为它决定后续任务的架构改法。
 
@@ -408,11 +438,20 @@ stat -c '%s' "下载到的文件路径"     # MSYS / Git Bash
 太慢，镜像实测单连接 3.8 MB/s、并行 22+ MB/s，所以「直连太慢」不再构成跳过哈希的理由：
 
 ```bash
-curl -L -o "$USERPROFILE/Downloads/ref.exe" "https://gh.xmly.dev/https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe"
+curl -fL --max-time 600 -o "$USERPROFILE/Downloads/ref.exe" "https://gh.xmly.dev/https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe"
+stat -c '%s' "$USERPROFILE/Downloads/ref.exe"     # MSYS / Git Bash；必须等于 499558899 才能用
 certutil -hashfile "$USERPROFILE/Downloads/ref.exe" SHA256
 certutil -hashfile "下载到的文件路径" SHA256
 ```
 
+- **`-f` 不可省**：没有 `-f` 时，镜像返回 4xx / 5xx 会把错误页正文写进 `ref.exe`，
+  `curl` 照样退出 0，于是「错误页」被当成参照文件——哈希必然对不上，且看起来像下载文件有问题。
+- **`--max-time 600` 不可省**：镜像挂住时必须响亮失败（`curl` 退出非 0），
+  而不是让这一步无限期停在那里。
+- **参照文件自身的字节数必须等于 `499558899`**（上面的 `stat -c '%s'`），
+  **在拿它当尺子之前就要核对**。参照被截断时它的哈希必然与下载文件不符，
+  而这个不符是**强制不通过**条件——于是截断的参照会直接伪造出「架构不成立」的假阴性。
+  若参照大小不等于 `499558899`，**换另一个镜像重取**，不要拿这个残缺参照继续、也不要因此降级成只比大小。
 - **参照文件不要放 `/tmp`**：它在 Windows 上不是 `certutil` 能解析的路径，落到 `%USERPROFILE%\Downloads`。
 - `curl` 对这些镜像可用：这 4 个镜像不在 Watt Toolkit 的 hosts 拦截列表里，curl 自带 CA 包即可。
 - 如果镜像路径拿到的参照本身可疑（例如下载过程报错），换另一个镜像重取，**不得**因此降级成只比大小。
@@ -440,7 +479,8 @@ certutil -hashfile "下载到的文件路径" SHA256
 
 **本闸门在防什么：** 长度正确但内容错位是本闸门最危险的假 PASS 形态，SHA-256 是唯一能抓到它的检查。
 
-**若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**（且失败消息确实指向写入 / 区块完整性，见 Step 3 归因表）：
+**若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**（且失败消息确实指向 `写入失败` 本身，见 Step 3 归因表；
+若失败消息是 `期望 206` / `Content-Range` / `截断`，那是镜像侧缺陷，不适用本条）：
 架构判定为**通过**，但 Task 2 之后的 `sink.write()` 必须实现串行化（Global Constraints 已要求），
 计划按此继续。
 
