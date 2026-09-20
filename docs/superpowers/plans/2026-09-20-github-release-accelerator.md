@@ -18,7 +18,13 @@
   **两处明列豁免，不视为违反本条：**
   1. `probe.ts` 的镜像探针 —— 体量固定 512 KiB，与目标文件大小无关。
   2. `main.ts` 的单连接回退 `fallbackDownload` —— 该路径没有定位写入能力，不整块进内存就无法保存；它是「明知慢但保可用」的降级路径，不参与并行热路径。
-- **`sink.write()` 必须 `await` 串行化**，不得并发调用。
+- **`sink.write()` 必须被 `await`**（不得 fire-and-forget，否则错误会被吞掉、背压也失效），
+  且每次写入必须携带正确的**绝对** `position`。
+  **不同 worker 的写入可以并发在途**：`FileSystemWritableFileStream` 在内部对写入排队串行化，
+  而显式 `position` 使写入顺序无关紧要。此点由 Task 1 的 spike **实测确认**——16 分块 / 4 worker
+  并发定位写入，产出文件的 SHA-256 与参照逐字节一致。
+  （本条先前写作「必须串行化，不得并发调用」，过于保守，且与上述实测矛盾；
+  真正需要保证的性质是「按绝对偏移写入且结果与完成顺序无关」，已由引擎的逐字节比对用例覆盖。）
 - **`createWritable()` 不得传 `keepExistingData: true`**。
 - **能力检测必须检测 `createWritable`**，而非仅检测 `showSaveFilePicker`。
 - 目标浏览器：Chromium 内核（Chrome / Edge / Opera）。Firefox 与 Safari 走 `<a download>` 回退路径。
