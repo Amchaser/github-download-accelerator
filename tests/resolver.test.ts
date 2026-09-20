@@ -85,4 +85,17 @@ describe('resolveMetadata', () => {
     await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
     expect(seen).toBe(`https://gh.xmly.dev/${GOOD}`);
   });
+
+  it('用 GET + Range: bytes=0-0 探测，而不是 HEAD（一次往返同时拿大小与 Range 支持）', async () => {
+    // 这条钉住本模块的设计前提：用带 Range 的 GET 一次拿到「总大小」与「是否支持 Range」。
+    // 若有人改成 HEAD，其余用例仍会全绿，而 206/200 分支的前提与「减少往返」的理由会静默失效。
+    let init: RequestInit | undefined;
+    const f = (async (_i: RequestInfo | URL, i?: RequestInit) => {
+      init = i;
+      return new Response(null, { status: 206, headers: { 'content-range': 'bytes 0-0/100' } });
+    }) as unknown as typeof fetch;
+    await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(init?.method ?? 'GET').toBe('GET');
+    expect((init?.headers as Record<string, string>).Range).toBe('bytes=0-0');
+  });
 });

@@ -42,17 +42,29 @@ export async function resolveMetadata(
     const m = cr ? /\/(\d+)\s*$/.exec(cr) : null;
     if (m) total = Number(m[1]);
   }
-  if (total === null) {
+  // Content-Length 兜底只对「非 206」成立。206 响应的 Content-Length 是**分片**长度
+  // （Range: bytes=0-0 时就是 1 字节），拿它当资产总大小会把 500MB 的资产变成
+  // 「1 字节下载成功」，而且能通过下面的 > 0 校验 —— 正是 spec 明令必须判为失败的
+  // 静默损坏形态。所以 206 但 Content-Range 缺失或不可解析时，直接掉到下面 throw。
+  if (total === null && !acceptRanges) {
     const len = res.headers.get('content-length');
     if (len) total = Number(len);
   }
   if (total === null || !Number.isFinite(total) || total <= 0) {
-    throw new Error('无法确定资源大小（响应既无 Content-Range 也无有效 Content-Length）');
+    throw new Error('无法确定资源大小（206 但 Content-Range 缺失或不可解析，或非 206 且无有效 Content-Length）');
   }
 
   const filename =
     filenameFromDisposition(res.headers.get('content-disposition')) ??
     decodeURIComponent(url.split('/').pop() ?? 'download.bin');
+
+  // 只需要响应头。若不取消，200 路径（镜像忽略 Range）会让整个文件在后台继续传输，
+  // 白占一个连接与镜像的并发配额 —— 而探针本就按镜像并行运行，可能占满下载引擎随后
+  // 要用的连接池，等于探针毒化了它本要保护的那条路径。206 路径虽只有 1 字节，一并取消。
+  // cancel() 是丢弃而非缓冲，不违反热路径禁令。
+  if (res.body) {
+    try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖上面已取到的元数据 */ }
+  }
 
   return { total, filename, acceptRanges };
 }
