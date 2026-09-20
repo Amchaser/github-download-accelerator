@@ -1063,6 +1063,25 @@ describe('resolveMetadata', () => {
     expect(init?.method ?? 'GET').toBe('GET');
     expect((init?.headers as Record<string, string>).Range).toBe('bytes=0-0');
   });
+
+  it('取完响应头后取消（丢弃）响应体，避免 200 路径在后台继续传完整个文件', async () => {
+    // 不取消的话，镜像忽略 Range 时整个文件会继续传输，白占连接与镜像并发配额；
+    // 探针按镜像并行运行，可能把下载引擎随后要用的连接池抽干。
+    let cancelled = false;
+    const body = new ReadableStream({ cancel() { cancelled = true; } });
+    const f = (async () =>
+      new Response(body, { status: 200, headers: { 'content-length': '12345' } })) as unknown as typeof fetch;
+    const meta = await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(meta.total).toBe(12345);
+    expect(cancelled).toBe(true);
+  });
+
+  it('206 但 Content-Range 不可解析时必须抛错，绝不退用分片的 Content-Length', async () => {
+    // 206 的 Content-Length 是**分片**长度（Range: bytes=0-0 时就是 1）。
+    // 若拿它当总大小，500MB 的资产会变成「1 字节下载成功」且无任何报错——静默损坏。
+    const f = fakeFetch(206, { 'content-range': 'bytes 0-0/*', 'content-length': '1' });
+    await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/无法确定/);
+  });
 });
 ```
 
@@ -1157,7 +1176,7 @@ export async function resolveMetadata(
 cd "D:/github_download++" && npx vitest run tests/resolver.test.ts
 ```
 
-预期：12 passed（`parseReleaseUrl` 组 5 个 + `resolveMetadata` 组 7 个）。
+预期：14 passed（`parseReleaseUrl` 组 5 个 + `resolveMetadata` 组 9 个）。
 
 - [ ] **Step 5: 提交**
 
