@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseReleaseUrl, resolveMetadata } from '../src/resolver';
+import { parseReleaseUrl, resolveMetadata, resolveMetadataFromMirrors } from '../src/resolver';
+import type { Mirror } from '../src/types';
 
 const GOOD = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
 
@@ -31,6 +32,13 @@ describe('parseReleaseUrl', () => {
   it('拒绝 raw/blob 链接（本工具只处理 Release 资产）', () => {
     expect(() => parseReleaseUrl('https://github.com/o/r/raw/main/a.exe')).toThrow();
     expect(() => parseReleaseUrl('https://github.com/o/r/blob/main/a.exe')).toThrow();
+  });
+
+  it('文件名含畸形百分号转义时不抛 URIError，退回原串', () => {
+    // decodeURIComponent('100%.zip') 抛 URIError：`%` 后必须是两位十六进制。
+    // 那是**上游数据**的问题，不是本工具的失败——用户不该看到「失败：URI malformed」。
+    const u = 'https://github.com/o/r/releases/download/v1/100%.zip';
+    expect(parseReleaseUrl(u).file).toBe('100%.zip');
   });
 });
 
@@ -128,5 +136,67 @@ describe('resolveMetadata', () => {
       new Response(body, { status: 200 })) as unknown as typeof fetch; // 无 Content-Length
     await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/无法确定/);
     expect(cancelled).toBe(true);
+  });
+
+  it('Content-Disposition 里的畸形百分号转义同样不抛 URIError', async () => {
+    // 文件名由镜像控制，正常世界之外的值必然出现（这里是 `%A`，只有一位十六进制）。
+    const f = fakeFetch(206, {
+      'content-range': 'bytes 0-0/100',
+      'content-disposition': 'attachment; filename="%E0%A4%A"',
+    });
+    const meta = await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(meta.filename).toBe('%E0%A4%A');
+  });
+});
+
+/** 一个「接受连接但永不回应」的镜像。真实 fetch 在 abort 时会拒绝，这里照实模拟。 */
+function silentFetch(): typeof fetch {
+  return (async (_i: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    })) as unknown as typeof fetch;
+}
+
+const MIRRORS: Mirror[] = [
+  { id: 'a', prefix: 'https://a.test/' },
+  { id: 'b', prefix: 'https://b.test/' },
+];
+
+/** 按镜像前缀分派：a.test 用 silent，其余用 good。 */
+function perMirror(silent: typeof fetch, good: typeof fetch): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).startsWith('https://a.test/') ? silent(input, init) : good(input, init)) as unknown as typeof fetch;
+}
+
+describe('resolveMetadata 的有界性', () => {
+  it('镜像接住连接却永不回应时按超时中断，不会永久挂起', async () => {
+    // 无超时的话这里**永不 settle**：main.ts 的 run() 不返回 → finally 不执行 →
+    // 按钮永久禁用，既无错误也无从取消。这正是元数据请求必须自带超时的理由。
+    await expect(
+      resolveMetadata(GOOD, 'https://a.test/', silentFetch(), undefined, 20),
+    ).rejects.toThrow(/超时/);
+  });
+
+  it('第一个镜像静默时改用下一个镜像，并报出是哪一个失败', async () => {
+    // 一个镜像静默或瞬时失败，绝不能让整轮下载失败（其余健康镜像本可完成）——
+    // 这是本项目的关键约束在元数据阶段的体现。
+    const good = fakeFetch(206, { 'content-range': 'bytes 0-0/499558899' });
+    const failed: string[] = [];
+    const meta = await resolveMetadataFromMirrors(
+      GOOD, MIRRORS, perMirror(silentFetch(), good), 20, (m) => failed.push(m.id),
+    );
+    expect(meta.total).toBe(499558899);
+    expect(meta.acceptRanges).toBe(true);
+    expect(failed).toEqual(['a']);   // 静默的那个被记录，且确实轮到了下一个
+  });
+
+  it('全部镜像都失败时抛最后一个错误（最接近此刻的实况）', async () => {
+    const f = (async (input: RequestInfo | URL) =>
+      new Response(null, { status: String(input).startsWith('https://a.test/') ? 500 : 503 })) as unknown as typeof fetch;
+    await expect(resolveMetadataFromMirrors(GOOD, MIRRORS, f, 20)).rejects.toThrow(/503/);
+  });
+
+  it('没有可用镜像时立即抛错，不做无谓等待', async () => {
+    await expect(resolveMetadataFromMirrors(GOOD, [], fakeFetch(206, {}), 20)).rejects.toThrow(/没有可用镜像/);
   });
 });
