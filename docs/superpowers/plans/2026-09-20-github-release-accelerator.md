@@ -1954,14 +1954,14 @@ cd "D:/github_download++" && git add -A && git commit -m "feat: 单页界面与�
 
 - [ ] **Step 1: 配置 base 路径**
 
-修改 `vite.config.ts`，加入 `base`。把 `<仓库名>` 替换为实际仓库名（**GitHub 仓库名不允许 `+` 字符**，故不能用 `github_download++`）：
+修改 `vite.config.ts`，加入 `base`。仓库名已定：**`github-download-accelerator`**（原目录名 `github_download++` 含 `+`，GitHub 仓库名不允许该字符）：
 
 ```ts
 import { defineConfig } from 'vite';
 
 export default defineConfig({
   root: '.',
-  base: '/<仓库名>/',
+  base: '/github-download-accelerator/',
   build: { outDir: 'dist' },
   test: { globals: true, environment: 'node' },
 });
@@ -2029,13 +2029,19 @@ cd "D:/github_download++" && git add -A && git commit -m "ci: GitHub Pages 自�
 cd "D:/github_download++" && git push -u origin main
 ```
 
+> **当前状态：用户决定暂不推送到 GitHub，仓库仅存在于本地。** 目标仓库名为
+> `github-download-accelerator`（Public），但**尚未创建**。执行到本步骤时先向用户确认是否建仓，
+> 不要擅自创建远程仓库或推送。
+> 届时建仓方式：用户在 github.com 新建空仓库（不勾 README），把 URL 交给执行者，
+> 执行者再 `git remote add origin <URL>` 并 push（首次 push 会弹 Git Credential Manager 登录）。
+
 - [ ] **Step 4: 在仓库设置中启用 Pages**
 
 用户需手动操作：仓库 → Settings → Pages → Source 选 **GitHub Actions**。
 
 - [ ] **Step 5: 验证线上可用**
 
-等 Actions 跑完，打开 `https://<用户名>.github.io/<仓库名>/`，用 Task 9 的同一条链接重跑一次，确认功能与本地一致。
+等 Actions 跑完，打开 `https://zhuiluo.github.io/github-download-accelerator/`，用 Task 9 的同一条链接重跑一次，确认功能与本地一致。
 
 ---
 
