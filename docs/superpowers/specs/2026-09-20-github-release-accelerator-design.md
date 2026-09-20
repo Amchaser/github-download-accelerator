@@ -220,8 +220,14 @@ HTTP/2 下浏览器对同一 host 只开一条 TCP 连接，所有 Range 流共�
 
 1. **永远通过原始 GitHub URL 请求**，让镜像每次重新 follow 302。
    302 落点是**限时签名 URL**（Azure/S3），缓存它必然过期。
-2. **绝不 `await response.blob()` / `arrayBuffer()`**。必须 `reader.read()` 流式，
+2. **下载热路径绝不 `await response.blob()` / `arrayBuffer()`**。必须 `reader.read()` 流式，
    即读即写即弃。否则 4 × 8 MB 并发直接爆内存。
+   **两处明列豁免，不视为违反本条：**
+   1. `probe.ts` 的镜像探针——体量固定 512 KiB，与目标文件大小无关；
+   2. `main.ts` 的单连接回退 `fallbackDownload`——该路径没有定位写入能力，不整块进内存
+      就无法保存，属「明知慢但保可用」的降级路径。
+   （豁免原先只写在实现计划的 Global Constraints 里，设计文档这侧漏了，导致只读本文档的人
+   会把 `probe.ts` 的 `arrayBuffer()` 误读成违规——由 Task 6 评审发现。）
 3. **`206` 校验不可省**。上游若忽略 Range 返回 `200`，把整包追加到部分文件上
    会静默产出损坏文件——这是最危险的失败模式。
 4. **写入必须被 `await`，且携带正确的绝对 `position`**。不同 worker 的写入**可以**并发在途——
