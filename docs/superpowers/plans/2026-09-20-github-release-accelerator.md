@@ -1208,7 +1208,8 @@ cd "D:/github_download++" && git add src/resolver.ts tests/resolver.test.ts && g
 
 **Interfaces:**
 - Consumes: `src/types.ts` 的 `Mirror`、`ProbeResult`
-- Produces: `KNOWN_MIRRORS: Mirror[]`、`class MirrorPool`，含 `available(): Mirror[]`、`recordSuccess(id: string, bytesPerSec: number): void`、`recordFailure(id: string): void`、`ranked(): Mirror[]`
+- Produces: `KNOWN_MIRRORS: Mirror[]`、`FAILURE_DEMOTE_THRESHOLD: number`（`3`）、`class MirrorPool`，含 `available(): Mirror[]`、`recordSuccess(id: string, bytesPerSec: number): void`、`recordFailure(id: string): void`、`ranked(): Mirror[]`
+  （`FAILURE_DEMOTE_THRESHOLD` 是测试导入、实现导出的，早先这行漏列了。）
 
 **设计要点：** 仅 4 个实测可用的镜像。健康度用「成功率 + 最近吞吐」排序，失败累计到阈值即降权到队尾，避免反复用坏镜像拖慢整体。
 
@@ -2362,10 +2363,18 @@ async function run(): Promise<void> {
     if (p.ok) pool.recordSuccess(p.mirror.id, p.bytesPerSec);
     else pool.recordFailure(p.mirror.id);
   }
-  const usable = probes.filter((p) => p.ok).map((p) => p.mirror);
+
+  // 必须用 pool.ranked()（按**实测吞吐**排序）而不是 probes 的顺序：
+  // probes 的顺序就是 MIRRORS 的注册顺序，与快慢无关，于是 usable[0] 只是
+  // 「第一个探针通过的镜像」，名字叫 best 会撒谎。实测镜像间吞吐可差 10 倍以上，
+  // 让元数据探测走最快的镜像是实打实的收益（那是一次真实往返，且它承载着
+  // 「镜像是否支持 Range」的判定，失败就要整体降级）。
+  const okIds = new Set(probes.filter((p) => p.ok).map((p) => p.mirror.id));
+  const usable = pool.ranked().filter((m) => okIds.has(m.id));
   if (usable.length === 0) throw new Error('全部镜像均不可用，请稍后重试');
 
-  const best = usable[0];
+  const best = usable[0]; // ranked() 已按实测吞吐降序
+  ui.log(`镜像次序（按实测吞吐）: ${usable.map((m) => m.id).join(' > ')}`);
   const meta = await resolveMetadata(raw, best.prefix);
   ui.log(`文件 ${meta.filename}  大小 ${ui.fmtBytes(meta.total)}`);
 
