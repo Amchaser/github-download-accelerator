@@ -1110,7 +1110,7 @@ describe('resolveMetadata', () => {
 cd "D:/github_download++" && npx vitest run tests/resolver.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/resolver"`。
+预期：FAIL，报模块无法解析（vitest 5 报 `Cannot find module '../src/resolver'`；措辞随 vitest 大版本变，见 Global Constraints）。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -1298,7 +1298,7 @@ describe('MirrorPool', () => {
 cd "D:/github_download++" && npx vitest run tests/mirrors.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/mirrors"`。
+预期：FAIL，报模块无法解析（vitest 5 报 `Cannot find module '../src/mirrors'`；措辞随 vitest 大版本变，见 Global Constraints）。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -1483,7 +1483,7 @@ describe('probeMirrors', () => {
 cd "D:/github_download++" && npx vitest run tests/probe.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/probe"`。
+预期：FAIL，报模块无法解析（vitest 5 报 `Cannot find module '../src/probe'`；措辞随 vitest 大版本变，见 Global Constraints）。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -1836,7 +1836,7 @@ describe('ChunkError', () => {
 cd "D:/github_download++" && npx vitest run tests/engine.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/engine"`。
+预期：FAIL，报模块无法解析（vitest 5 报 `Cannot find module '../src/engine'`；措辞随 vitest 大版本变，见 Global Constraints）。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -2134,7 +2134,7 @@ describe('createFsaSink', () => {
 cd "D:/github_download++" && npx vitest run tests/sink.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/sink"`。
+预期：FAIL，报模块无法解析（vitest 5 报 `Cannot find module '../src/sink'`；措辞随 vitest 大版本变，见 Global Constraints）。
 
 - [ ] **Step 3: 写最小实现**
 
