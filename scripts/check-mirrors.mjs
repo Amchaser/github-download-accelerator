@@ -93,6 +93,13 @@ const TARGET =
 // 镜像要放行**跨域**读取，这个头是必须的（浏览器页面的 Origin）。
 const ORIGIN = 'https://amchaser.github.io';
 
+// **必须伪装成浏览器的 User-Agent。** 实测（2026-09-20）：gh.xxooo.cf 与 gh.monlor.com
+// 在浏览器 UA 下返回 206，在 curl / Node 的默认 UA 下**超时**——它们对非浏览器客户端
+// 区别对待。本脚本要复现的是**应用**的经历，不是某个 HTTP 客户端的，故必须带这个头。
+// （先前不带，导致报告把「只对 Node UA 不可用」误读成「镜像死了」。）
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
 const args = process.argv.slice(2);
 const asJson = args.includes('--json');
 const tIdx = args.indexOf('--timeout');
@@ -115,7 +122,7 @@ async function check(prefix) {
   const t0 = Date.now();
   try {
     const res = await fetch(url, {
-      headers: { Range: `bytes=0-${PROBE_BYTES - 1}`, Origin: ORIGIN },
+      headers: { Range: `bytes=0-${PROBE_BYTES - 1}`, Origin: ORIGIN, 'User-Agent': UA },
       signal: ac.signal,
     });
 
