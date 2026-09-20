@@ -651,7 +651,15 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   root: '.',
   build: { outDir: 'dist' },
-  test: { globals: true, environment: 'node' },
+  test: {
+    globals: true,
+    environment: 'node',
+    // 一旦显式指定 exclude，vitest 的默认值就被整体替换，必须自己带上 node_modules / dist。
+    // 加 .superpowers 是因为 vitest 的默认 include 是 **/*.test.ts，它**不看 .gitignore**——
+    // 放在忽略目录里的临时验证测试文件会被一起收集，把套件从 2 文件/12 用例静默膨胀成
+    // 3 文件/25 用例，让「预期 N passed」这类核对彻底失效（本项目已两次被错误计数误导）。
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+  },
 });
 ```
 
@@ -840,7 +848,7 @@ describe('splitChunk', () => {
     expect(splitChunk({ index: 0, start: 0, end: MIN_CHUNK_SIZE - 1 })).toBeNull();
   });
 
-  it('可用 minChunkSize 覆盖默认下限（测试与小文件场景需要）', () => {
+  it('minChunkSize 可覆盖默认下限，并钉住拆分下界 len === 2*minChunkSize', () => {
     expect(splitChunk({ index: 0, start: 0, end: 1023 }, 256)).toEqual([
       { index: 0, start: 0, end: 511 },
       { index: 1, start: 512, end: 1023 },
@@ -920,7 +928,9 @@ export function splitChunk(chunk: Chunk, minChunkSize: number = MIN_CHUNK_SIZE):
 cd "D:/github_download++" && npx vitest run tests/planner.test.ts
 ```
 
-预期：12 passed（`plan` 组 6 个 + `splitChunk` 组 6 个）。
+预期：11 passed（`plan` 组 6 个 + `splitChunk` 组 5 个）。
+（`splitChunk` 组的第 5 个 `it` 内含 3 条断言——1023 拆分、511 拆分、510 返回 null——
+它们是同一个 `it` 里的断言，不是独立的用例，别把计数算成 6。）
 
 - [ ] **Step 5: 提交**
 
@@ -2419,13 +2429,20 @@ cd "D:/github_download++" && git add -A && git commit -m "feat: 单页界面与�
 
 ```ts
 // 同 Task 2：从 'vitest/config' 引入，否则 `test` 键失去类型检查。
+// test 字段必须与 Task 2 完全一致（含 exclude）——本片段展示的是整个文件，
+// 漏掉 exclude 会把 Task 2 加的防护静默删掉，让 .superpowers 下的临时测试文件
+// 重新被收集、套件计数再次失真。
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   root: '.',
   base: '/github-download-accelerator/',
   build: { outDir: 'dist' },
-  test: { globals: true, environment: 'node' },
+  test: {
+    globals: true,
+    environment: 'node',
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+  },
 });
 ```
 
