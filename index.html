@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Release 加速下载</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 system-ui, sans-serif; max-width: 780px; margin: 40px auto; padding: 0 20px; }
+  input[type=url] { width: 100%; padding: 10px; font-size: 14px; box-sizing: border-box; }
+  button { padding: 10px 22px; font-size: 15px; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: .5; }
+  #bar { height: 22px; background: #8883; border-radius: 4px; overflow: hidden; margin: 14px 0 6px; }
+  #fill { height: 100%; width: 0; background: #3b82f6; transition: width .15s; }
+  #stats { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #8883; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; color: #888; max-height: 190px; overflow: auto; }
+  .err { color: #dc2626; }
+  #warn { padding: 10px; border: 1px solid #f59e0b; border-radius: 4px; margin-bottom: 14px; display: none; }
+</style>
+</head>
+<body>
+  <h1>GitHub Release 加速下载</h1>
+  <div id="warn"></div>
+  <p><input type="url" id="url" placeholder="https://github.com/owner/repo/releases/download/tag/file.exe" autocomplete="off"></p>
+  <p><button id="go">开始下载</button> <span id="hint"></span></p>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stats"><span id="pct">—</span><span id="spd"></span><span id="eta"></span></div>
+  <div id="mirrors"></div>
+  <div id="log"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
