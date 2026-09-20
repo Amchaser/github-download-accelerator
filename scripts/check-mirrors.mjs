@@ -21,10 +21,13 @@
  *
  * 用法：
  *   npm run mirrors                                         # 推荐入口（已带好下面那个 flag）
- *   node --use-system-ca scripts/check-mirrors.mjs          # 等价的手写形式
+ *   node --use-system-ca scripts/check-mirrors.mjs --runs 3 # 采样 3 轮——**决定改白名单前用这个**
  *   node ... --timeout 10000                                # 放宽超时（诊断「是死了还是只是慢」）
  *   node ... https://a/ https://b/                          # 只测给定的
  *   node ... --json
+ *
+ * **单次运行不足以改白名单。** 公共镜像的可用性在分钟内剧烈波动，拿一次劣化采样
+ * 去替换，会把当天下午还在跑 12 MB/s 的好镜像换掉。跨时段、多轮都稳定失败的才该换。
  *
  * ⚠️ **必须带 `--use-system-ca`**（npm script 已内置）。本机装了 Watt Toolkit，
  * 它以 hosts 模式做 MITM，其自签 CA 只进 Windows 证书存储；Node 默认只信自带的
@@ -41,13 +44,38 @@ const DEFAULT_TIMEOUT_MS = 3000;
 
 // ── 候选池 ────────────────────────────────────────────────────────────────
 // 前缀用法是 `prefix + 原始 GitHub URL`，故结尾必须带 `/`。加候选直接加一行。
+//
+// 只收**前缀式**代理。两类看似是镜像但用不了，别往里加：
+//   - 域名替换型（`bgithub.xyz`、`gitclone.com`、`fastgit.org`）：模型是「把链接里的
+//     github.com 换掉」，而本应用只会拼 `prefix + 原始URL`，拼不出来。
+//   - `http://` 的：应用跑在 HTTPS 页面上，浏览器会按混合内容策略**直接拦掉**，
+//     连请求都不会发出去。
 const CANDIDATES = [
-  // 当前白名单（src/mirrors.ts）
+  // ── 当前白名单（src/mirrors.ts）──────────────────────────────────────
   'https://gh.xmly.dev/',
   'https://gh.xxooo.cf/',
   'https://gh.ddlc.top/',
   'https://gh.monlor.com/',
-  // 历史上有 Range 但**缺 CORS**，留着以便哪天补上能被自动发现
+
+  // ── 2026-09-20 新收集的一批 ─────────────────────────────────────────
+  'https://ghproxy.homeboyc.cn/',
+  'https://ghp.ci/',
+  'https://gh.llkk.cc/',
+  'https://hub.gitmirror.com/',
+  'https://github.moeyy.xyz/',
+  'https://moeyy.cn/gh-proxy/',
+  'https://ghproxy.cc/',
+  'https://ghps.cc/',
+  'https://gh.jasonzeng.dev/',
+  'https://gh.con.sh/',
+  'https://gh-proxy.ygxz.in/',
+  'https://gh.07.kg/',
+  'https://gitproxy.click/',
+  'https://ghproxy.cfd/',
+  'https://ghproxy.link/',
+  'https://gh.api.99988866.xyz/',
+
+  // ── 历史上有 Range 但缺 CORS；留着以便哪天补上能被自动发现 ──────────
   'https://gh-proxy.com/',
   'https://ghproxy.net/',
   'https://v6.gh-proxy.org/',
@@ -68,8 +96,10 @@ const ORIGIN = 'https://amchaser.github.io';
 const args = process.argv.slice(2);
 const asJson = args.includes('--json');
 const tIdx = args.indexOf('--timeout');
+const rIdx = args.indexOf('--runs');
 const timeoutMs = tIdx >= 0 ? Number(args[tIdx + 1]) || DEFAULT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-const custom = args.filter((a, i) => !a.startsWith('--') && i !== tIdx + 1);
+const runs = rIdx >= 0 ? Math.max(1, Number(args[rIdx + 1]) || 1) : 1;
+const custom = args.filter((a, i) => !a.startsWith('--') && i !== tIdx + 1 && i !== rIdx + 1);
 const pool = custom.length ? custom : CANDIDATES;
 
 const normalize = (u) => (u.endsWith('/') ? u : u + '/');
@@ -135,30 +165,64 @@ async function check(prefix) {
 
 const mb = (bps) => (bps / 1024 / 1024).toFixed(2) + ' MB/s';
 
-const results = await Promise.all(pool.map(check));
-const ok = results.filter((r) => r.ok).sort((a, b) => b.bytesPerSec - a.bytesPerSec);
-const bad = results.filter((r) => !r.ok);
+// ── 采样 runs 轮 ──────────────────────────────────────────────────────────
+// **单次运行只是一个瞬间的采样，不能作为改白名单的依据。** 实测（2026-09-20）：
+// 同一个镜像在几分钟内 918ms → 6313ms → 超时；连跑几次的合格数在 0~2 之间摆动；
+// 当天下午实测 12 MB/s 的镜像，两小时后只有 0.25 MB/s（两个独立 HTTP 客户端一致）。
+// 若拿一次劣化采样去替换白名单，会把好镜像换掉——所以判断依据是「N 轮里过几轮」。
+const tally = new Map();
+for (const p of pool) {
+  tally.set(normalize(p), { prefix: normalize(p), passed: 0, latencies: [], bps: [], reasons: new Map() });
+}
+
+for (let i = 0; i < runs; i++) {
+  const rs = await Promise.all(pool.map(check));
+  for (const r of rs) {
+    const t = tally.get(r.prefix);
+    if (r.ok) { t.passed++; t.latencies.push(r.elapsedMs); t.bps.push(r.bytesPerSec); }
+    else t.reasons.set(r.reason, (t.reasons.get(r.reason) || 0) + 1);
+  }
+}
+
+const median = (xs) => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+};
+const rows = [...tally.values()].sort(
+  (a, b) => b.passed - a.passed || (median(b.bps) ?? 0) - (median(a.bps) ?? 0),
+);
+const full = rows.filter((r) => r.passed === runs);
 
 if (asJson) {
-  console.log(JSON.stringify({ target: TARGET, timeoutMs, probeBytes: PROBE_BYTES, ok, bad }, null, 2));
+  console.log(JSON.stringify({ target: TARGET, timeoutMs, probeBytes: PROBE_BYTES, runs, rows }, null, 2));
 } else {
   console.log(`探测目标   ${TARGET}`);
   console.log(`判据       Range ${PROBE_BYTES / 1024} KiB + CORS，超时 ${timeoutMs}ms（与应用 probe.ts 一致）`);
+  console.log(`采样       ${runs} 轮`);
   console.log(`⚠️  吞吐仅供参考：Node 走 HTTP/1.1，浏览器走 HTTP/2\n`);
 
-  console.log(`=== 合格 ${ok.length} / ${results.length} ===`);
-  if (!ok.length) console.log('  （一个都没有——这就是应用此刻会报「全部镜像均不可用」的原因）');
-  for (const r of ok) {
-    console.log(`  ✓ ${r.prefix.padEnd(30)} ${String(r.elapsedMs).padStart(6)}ms  ${mb(r.bytesPerSec)}`);
+  console.log('=== 结果（通过轮数 / 总轮数）===');
+  for (const r of rows) {
+    const mark = r.passed === runs ? '✓' : r.passed === 0 ? '✗' : '~';
+    const lat = median(r.latencies);
+    const detail = r.passed > 0
+      ? `${String(lat).padStart(6)}ms  ${mb(median(r.bps))}`
+      : [...r.reasons.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    console.log(`  ${mark} ${r.passed}/${runs}  ${r.prefix.padEnd(32)} ${detail}`);
   }
 
-  console.log(`\n=== 不合格 ${bad.length} ===`);
-  for (const r of bad) console.log(`  ✗ ${r.prefix.padEnd(30)} ${r.reason}`);
+  if (runs === 1) {
+    console.log('\n⚠️  只跑了 1 轮。单次运行只是瞬间采样，**不足以据此改白名单**——');
+    console.log('   请用 `--runs 3`（或换个时段再跑）后再决定。');
+  }
 
-  if (ok.length) {
-    console.log('\n=== 可直接粘进 src/mirrors.ts（按实测吞吐降序）===');
-    for (const r of ok) {
-      console.log(`  { id: '${new URL(r.prefix).hostname}', prefix: '${r.prefix}' },`);
-    }
+  if (full.length) {
+    console.log(`\n=== ${runs} 轮全部通过，可粘进 src/mirrors.ts（按中位吞吐降序）===`);
+    for (const r of full) console.log(`  { id: '${new URL(r.prefix).hostname}', prefix: '${r.prefix}' },`);
+  } else {
+    console.log(`\n=== 没有任何镜像在 ${runs} 轮里全部通过 ===`);
+    console.log('   ⇒ **先不要改白名单。** 这通常是时段性的网络/镜像劣化，不是候选池的问题。');
+    console.log('     换个时段重跑；只有**跨多个时段都稳定失败**的镜像才值得替换。');
   }
 }
