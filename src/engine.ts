@@ -280,8 +280,11 @@ export async function download(opts: DownloadOptions): Promise<void> {
 
         job.attempts++;
 
-        // 403 优先走「对半拆分」降级：把 Range 缩小再试
-        if (/403/.test(err.message)) {
+        // 403 优先走「对半拆分」降级：把 Range 缩小再试。
+        // 匹配 `HTTP 403` 而非裸 `403`：错误消息里会带字节偏移（如「写入失败（位置 1403963）」）
+        // 或区间文本（如 Content-Range 里的 "bytes 0-403/…"），裸 `403` 会命中这些数字，
+        // 把一次单纯的 I/O 失败或响应头缺陷误判成「大 Range 被拒」，白白对半拆分。
+        if (/HTTP 403/.test(err.message)) {
           const halves = splitChunk(job.chunk, minChunkSize);
           if (halves) {
             queue.push({ chunk: halves[0], attempts: 0 }, { chunk: halves[1], attempts: 0 });
