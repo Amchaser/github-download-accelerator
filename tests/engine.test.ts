@@ -286,16 +286,41 @@ describe('download', () => {
     // 每 1ms 吐 1 字节且永远吐不完：空闲计时被不断重置，故空闲超时（设 60s）永不触发，
     // 只有墙钟死线（设 30ms）能中断。**这正是实测中把下载无限期拖住的形态**——
     // 两次 500MB 实测都停在 98.x%，日志无错、字节数仍在极慢增长。
-    // 用 setTimeout 而非同步 enqueue，是为了让出宏任务，使计时器有机会触发。
+    //
+    // 这个 fake 流有三条硬性要求，缺一则本用例就不再是在测死线：
+    //
+    // 1. **投递量必须止于本块长度（1024 字节），一个字节都不许多。**
+    //    滴水速率依平台而变（本机实测：Windows 定时器粒度 15.6ms，CI 的 Linux 约 1ms，
+    //    快 30 倍以上），而 1024 这个越界门槛对此只有约 34 倍余量——太薄，会在 Linux 上被击穿：
+    //    字节先灌满 1024，撞上「越界写入」守卫，断言 /墙钟死线/ 便对不上（CI run #1 即如此）。
+    //    封顶之后，越界守卫在**结构上**不可能触发，于是无论平台快慢、无论滴水多快，
+    //    唯一出口都只剩死线——本断言不再依赖任何计时粒度。
+    // 2. **取满后 pull 须返回一个永不 settle 的 promise**，而不是直接 return：
+    //    直接返回会让流认为队列仍空并立刻重入 pull，形成忙转。
+    // 3. **流必须在 abort 时报错**：否则它停驻处的那个挂起 read() 永不结算，
+    //    死线虽已触发、错误却传不出来，用例会以超时而非断言失败收场。
     let abortedFlag = false;
+    const CHUNK_LEN = 1024;
+    let sent = 0;
     const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
       const signal = init?.signal;
       const body = new ReadableStream({
+        start(c) {
+          const kill = () => { try { c.error(new Error('aborted')); } catch (e) { /* 流已关闭 */ } };
+          if (signal?.aborted) kill();
+          else signal?.addEventListener('abort', kill);
+        },
         pull(c) {
-          setTimeout(() => {
-            if (signal?.aborted) { c.error(new Error('aborted')); return; }
-            try { c.enqueue(new Uint8Array(1)); } catch (e) { /* 流已关闭 */ }
-          }, 1);
+          // 取满本块后既不吐字节也不结束流：让块停在「差最后一个 read」的状态，
+          // 从而把决定权完全交给墙钟死线。
+          if (sent >= CHUNK_LEN) return new Promise<void>(() => { /* 永不 settle */ });
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              sent++;
+              try { c.enqueue(new Uint8Array(1)); } catch (e) { /* 流已关闭 */ }
+              resolve();
+            }, 1);
+          });
         },
       });
       return new Response(body, {
