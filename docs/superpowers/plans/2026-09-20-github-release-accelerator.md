@@ -1721,7 +1721,7 @@ describe('download', () => {
       })) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow(/Content-Range/);
   });
 
@@ -1734,7 +1734,7 @@ describe('download', () => {
       })) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow(/字节数不足/);
   });
 
@@ -1743,6 +1743,8 @@ describe('download', () => {
     const { f } = rangeServer(total, {
       failOn: (_s, _e, prefix) => (prefix === 'https://a.test/' ? 500 : null),
     });
+    // 本条**保留**真实退避：它的机制就是「健康镜像在那 200ms 退避窗口内接手」，
+    // 换成极小退避会让被测行为本身消失。其余用例只是路过退避代码，故传 5 以省去等待。
     const sink = new MemSink(total);
     await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
     expect(sink.buf).toEqual(expected(total));
@@ -1785,7 +1787,7 @@ describe('download', () => {
     const f = (async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow();
     expect(sink.aborted).toBe(true);
   });
@@ -1819,7 +1821,7 @@ describe('download', () => {
     }) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow();
     // 重试上限由 maxAttemptsPerChunk（默认 5）按「块」计，不是按镜像计——
     // 这里只要求「不失控」即可，不断言具体次数。
