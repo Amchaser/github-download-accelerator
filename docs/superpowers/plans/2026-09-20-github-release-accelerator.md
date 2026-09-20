@@ -2406,7 +2406,32 @@ describe('createFsaSink', () => {
       FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
     } as never;
     const sink = await createFsaSink('a.bin', win);
-    await sink.abort();
+    await expect(sink.abort()).resolves.toBeUndefined();   // 标题里的「不抛错」显式断言
+    expect(close).not.toHaveBeenCalled();
+  });
+  it('abort 会等待流自身的 abort 完成，不会提前 resolve', async () => {
+    // 引擎的失败路径与 UI 切单连接回退都在 await sink.abort() 之后继续；若把 :43 的
+    // await 去掉（fire-and-forget），取消尚未完成就会进入下一步，而现有两条 abort 用例
+    // 都会照样通过——这条专门钉住那个 await。
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const write = vi.fn();
+    const close = vi.fn();
+    const abort = vi.fn(() => gate);
+    const win = {
+      showSaveFilePicker: vi.fn().mockResolvedValue({
+        createWritable: vi.fn().mockResolvedValue({ write, close, abort }),
+      }),
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+    const sink = await createFsaSink('a.bin', win);
+    let settled = false;
+    const p = sink.abort().then(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 0));   // 让一轮宏任务过去
+    expect(settled).toBe(false);                  // 流未放行前不得 resolve
+    release();
+    await p;
+    expect(settled).toBe(true);
     expect(close).not.toHaveBeenCalled();
   });
 });
@@ -2465,8 +2490,12 @@ function wrap(stream: {
       // 与「方法存在但返回 undefined」——同步 abort 会让 close 在其后**再跑一次**，
       // 把刚丢弃的文件又提交了。
       // 正确降级：无 abort 时**什么都不做**——不提交即等于丢弃，语义恰好一致。
-      // 也不抛错：此处多处于失败路径，抛次生错误会掩盖真正的死因。
-      if (stream.abort) {
+      // 注意：此处仍会**传播**流自身 abort() 的拒绝（上游 await 得到它才是对的），
+      // 只在「没有可调用的 abort」时才什么都不做。
+      // 用 typeof 检查而非真值检查：非函数的 abort 属性（如 { abort: 42 }）会走到
+      // 这里的调用并抛 TypeError，那样「不抛错」就不成立了。也顺手把这里与上面的检测
+      // 统一成同一写法。
+      if (typeof stream.abort === 'function') {
         await stream.abort();
       }
     },
@@ -2493,7 +2522,7 @@ export async function createFsaSink(suggestedName: string, win: unknown = global
 cd "D:/github_download++" && npx vitest run tests/sink.test.ts
 ```
 
-预期：10 passed（原 6 条 + 4 条修复守卫：约束原名的 iOS-Firefox 形状、null 安全、同步 abort 只调 abort、无 abort 时也不 close）。
+预期：11 passed（原 6 条 + 5 条修复守卫：约束原名的 iOS-Firefox 形状、null 安全、同步 abort 只调 abort、无 abort 时也不 close、abort 会等待流自身完成）。
 
 - [ ] **Step 5: 全量测试 + 类型检查 + 提交**
 

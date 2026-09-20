@@ -96,7 +96,32 @@ describe('createFsaSink', () => {
       FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
     } as never;
     const sink = await createFsaSink('a.bin', win);
-    await sink.abort();
+    await expect(sink.abort()).resolves.toBeUndefined();   // 标题里的「不抛错」显式断言
+    expect(close).not.toHaveBeenCalled();
+  });
+  it('abort 会等待流自身的 abort 完成，不会提前 resolve', async () => {
+    // 引擎的失败路径与 UI 切单连接回退都在 await sink.abort() 之后继续；若把 :43 的
+    // await 去掉（fire-and-forget），取消尚未完成就会进入下一步，而现有两条 abort 用例
+    // 都会照样通过——这条专门钉住那个 await。
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const write = vi.fn();
+    const close = vi.fn();
+    const abort = vi.fn(() => gate);
+    const win = {
+      showSaveFilePicker: vi.fn().mockResolvedValue({
+        createWritable: vi.fn().mockResolvedValue({ write, close, abort }),
+      }),
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+    const sink = await createFsaSink('a.bin', win);
+    let settled = false;
+    const p = sink.abort().then(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 0));   // 让一轮宏任务过去
+    expect(settled).toBe(false);                  // 流未放行前不得 resolve
+    release();
+    await p;
+    expect(settled).toBe(true);
     expect(close).not.toHaveBeenCalled();
   });
 });

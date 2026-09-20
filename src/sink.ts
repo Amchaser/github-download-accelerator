@@ -38,8 +38,12 @@ function wrap(stream: {
       // 与「方法存在但返回 undefined」——同步 abort 会让 close 在其后**再跑一次**，
       // 把刚丢弃的文件又提交了。
       // 正确降级：无 abort 时**什么都不做**——不提交即等于丢弃，语义恰好一致。
-      // 也不抛错：此处多处于失败路径，抛次生错误会掩盖真正的死因。
-      if (stream.abort) {
+      // 注意：此处仍会**传播**流自身 abort() 的拒绝（上游 await 得到它才是对的），
+      // 只在「没有可调用的 abort」时才什么都不做。
+      // 用 typeof 检查而非真值检查：非函数的 abort 属性（如 { abort: 42 }）会走到
+      // 这里的调用并抛 TypeError，那样「不抛错」就不成立了。也顺手把这里与上面的检测
+      // 统一成同一写法。
+      if (typeof stream.abort === 'function') {
         await stream.abort();
       }
     },
