@@ -2324,6 +2324,19 @@ describe('supportsFsa', () => {
   it('仅有 showSaveFilePicker 而 createWritable 缺失时为 false（iOS Firefox 的情况）', () => {
     expect(supportsFsa({ showSaveFilePicker: vi.fn() } as never)).toBe(false);
   });
+
+  it('句柄存在但 createWritable 缺失时为 false（约束原名的形状）', () => {
+    // 前一条用例传的对象里**根本没有** FileSystemFileHandle，故它区分不出
+    // 「检查 createWritable」与「只检查 FileSystemFileHandle 是否存在」——
+    // 把实现换成后者也照样通过。这一条才是约束真正要钉的形状。
+    expect(
+      supportsFsa({ showSaveFilePicker: vi.fn(), FileSystemFileHandle: { prototype: {} } } as never),
+    ).toBe(false);
+  });
+
+  it('显式传入 null 时返回 false 而非抛错', () => {
+    expect(supportsFsa(null)).toBe(false);
+  });
 });
 
 describe('createFsaSink', () => {
@@ -2364,6 +2377,38 @@ describe('createFsaSink', () => {
     await createFsaSink('a.bin', win);
     expect(createWritable).toHaveBeenCalledWith();
   });
+
+  it('abort 为同步方法时只调 abort，绝不调 close', async () => {
+    // 原写法 `abort?.() ?? close()` 在这里会连 close 一起调用——把 abort 刚丢弃的
+    // 半成品又重新提交。同步 abort 返回 undefined，`??` 分辨不出这与「方法不存在」。
+    const write = vi.fn();
+    const close = vi.fn();
+    const abort = vi.fn(); // 同步，返回 undefined
+    const win = {
+      showSaveFilePicker: vi.fn().mockResolvedValue({
+        createWritable: vi.fn().mockResolvedValue({ write, close, abort }),
+      }),
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+    const sink = await createFsaSink('a.bin', win);
+    await sink.abort();
+    expect(abort).toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('流没有 abort 时也不调 close（不提交半成品），且不抛错', async () => {
+    const write = vi.fn();
+    const close = vi.fn();
+    const win = {
+      showSaveFilePicker: vi.fn().mockResolvedValue({
+        createWritable: vi.fn().mockResolvedValue({ write, close }), // 无 abort
+      }),
+      FileSystemFileHandle: { prototype: { createWritable: vi.fn() } },
+    } as never;
+    const sink = await createFsaSink('a.bin', win);
+    await sink.abort();
+    expect(close).not.toHaveBeenCalled();
+  });
 });
 ```
 
@@ -2394,6 +2439,9 @@ export class UnsupportedBrowserError extends Error {
  * showSaveFilePicker 却没有 createWritable。
  */
 export function supportsFsa(win: unknown = globalThis): boolean {
+  // 显式传入 null 会让 `typeof w.showSaveFilePicker` 抛 TypeError。参数类型是 unknown，
+  // 故 null 能通过类型检查——而检测函数应当**总是返回布尔**，不能有抛错路径。
+  if (win == null) return false;
   const w = win as Record<string, unknown>;
   if (typeof w.showSaveFilePicker !== 'function') return false;
   const proto = (w.FileSystemFileHandle as { prototype?: Record<string, unknown> } | undefined)?.prototype;
@@ -2404,13 +2452,23 @@ export function supportsFsa(win: unknown = globalThis): boolean {
 function wrap(stream: {
   write(d: { type: 'write'; position: number; data: Uint8Array }): Promise<void>;
   close(): Promise<void>;
-  abort?(): Promise<void>;
+  abort?(): Promise<void> | void;   // 规范保证存在且返回 Promise；允许 void 以覆盖被包装/被 mock 的流
 }): Sink {
   return {
     write: (position, data) => stream.write({ type: 'write', position, data }),
     close: () => stream.close(),
     abort: async () => {
-      await (stream.abort?.() ?? stream.close());
+      // **绝不能用 close() 兜底**：FSA 的写入先进临时文件，只有 close() 才提交，
+      // 而 abort() 的用途是**丢弃**（引擎在失败路径调它、UI 在切单连接回退前也调它）。
+      // 回退到 close() 会把半成品提交成正式文件；若目标已存在，还会覆盖用户的原文件。
+      // 而且 `abort?.() ?? close()` 这个写法本身就是错的：`??` 分辨不出「方法不存在」
+      // 与「方法存在但返回 undefined」——同步 abort 会让 close 在其后**再跑一次**，
+      // 把刚丢弃的文件又提交了。
+      // 正确降级：无 abort 时**什么都不做**——不提交即等于丢弃，语义恰好一致。
+      // 也不抛错：此处多处于失败路径，抛次生错误会掩盖真正的死因。
+      if (stream.abort) {
+        await stream.abort();
+      }
     },
   };
 }
@@ -2435,7 +2493,7 @@ export async function createFsaSink(suggestedName: string, win: unknown = global
 cd "D:/github_download++" && npx vitest run tests/sink.test.ts
 ```
 
-预期：6 passed。
+预期：10 passed（原 6 条 + 4 条修复守卫：约束原名的 iOS-Firefox 形状、null 安全、同步 abort 只调 abort、无 abort 时也不 close）。
 
 - [ ] **Step 5: 全量测试 + 类型检查 + 提交**
 

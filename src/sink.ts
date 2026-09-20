@@ -12,6 +12,9 @@ export class UnsupportedBrowserError extends Error {
  * showSaveFilePicker 却没有 createWritable。
  */
 export function supportsFsa(win: unknown = globalThis): boolean {
+  // 显式传入 null 会让 `typeof w.showSaveFilePicker` 抛 TypeError。参数类型是 unknown，
+  // 故 null 能通过类型检查——而检测函数应当**总是返回布尔**，不能有抛错路径。
+  if (win == null) return false;
   const w = win as Record<string, unknown>;
   if (typeof w.showSaveFilePicker !== 'function') return false;
   const proto = (w.FileSystemFileHandle as { prototype?: Record<string, unknown> } | undefined)?.prototype;
@@ -22,13 +25,23 @@ export function supportsFsa(win: unknown = globalThis): boolean {
 function wrap(stream: {
   write(d: { type: 'write'; position: number; data: Uint8Array }): Promise<void>;
   close(): Promise<void>;
-  abort?(): Promise<void>;
+  abort?(): Promise<void> | void;   // 规范保证存在且返回 Promise；允许 void 以覆盖被包装/被 mock 的流
 }): Sink {
   return {
     write: (position, data) => stream.write({ type: 'write', position, data }),
     close: () => stream.close(),
     abort: async () => {
-      await (stream.abort?.() ?? stream.close());
+      // **绝不能用 close() 兜底**：FSA 的写入先进临时文件，只有 close() 才提交，
+      // 而 abort() 的用途是**丢弃**（引擎在失败路径调它、UI 在切单连接回退前也调它）。
+      // 回退到 close() 会把半成品提交成正式文件；若目标已存在，还会覆盖用户的原文件。
+      // 而且 `abort?.() ?? close()` 这个写法本身就是错的：`??` 分辨不出「方法不存在」
+      // 与「方法存在但返回 undefined」——同步 abort 会让 close 在其后**再跑一次**，
+      // 把刚丢弃的文件又提交了。
+      // 正确降级：无 abort 时**什么都不做**——不提交即等于丢弃，语义恰好一致。
+      // 也不抛错：此处多处于失败路径，抛次生错误会掩盖真正的死因。
+      if (stream.abort) {
+        await stream.abort();
+      }
     },
   };
 }
