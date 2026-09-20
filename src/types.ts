@@ -13,7 +13,7 @@ export interface Mirror {
 
 /** 下载落盘目标。实现可以是 FSA，也可以是内存回退。 */
 export interface Sink {
-  /** 从文件顶部起 position 字节处写入 data。实现必须串行化，调用方会 await。 */
+  /** 在文件顶部起 position 字节处写入 data。调用方会 await；写入按绝对 position 定位，与完成顺序无关。 */
   write(position: number, data: Uint8Array): Promise<void>;
   close(): Promise<void>;
   abort(): Promise<void>;

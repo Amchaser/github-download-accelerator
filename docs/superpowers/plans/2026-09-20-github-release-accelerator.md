@@ -498,9 +498,10 @@ stat -c '%s' "下载到的文件路径"     # MSYS / Git Bash
 **只有**失败消息指向写入本身（`写入失败`）时，才把 `spike/fsa-parallel.html` 顶部的
 `const WORKERS = 4;` 改成 `1` 后原样重跑：
 
-- `WORKERS=1` **成功** ⇒ 定位写入本身可行，问题只在「并发写未串行化」（spike 里每个 worker 各自
-  `await stream.write()`，彼此并未串行）。按 Global Constraints 给 `sink.write()` 加写互斥即可救回架构，
-  **这不算本任务不通过**。
+- `WORKERS=1` **成功** ⇒ 定位写入本身可行，问题只在并发下的写入交错（spike 里每个 worker 各自
+  `await stream.write()`，彼此并未串行）。可给 `sink.write()` 加写互斥救回架构，**这不算本任务不通过**。
+  注：**该分支未触发**——实测 `WORKERS=4` 即通过且哈希与参照一致，说明并发写在 FSA 上安全
+  （FSA 内部对写入排队，显式 position 使顺序无关）。
 - `WORKERS=1` **仍失败** ⇒ 定位写入本身不被支持，架构不成立，本任务不通过。
 
 **若失败消息指向镜像请求 / 流问题（含 `期望 206` / `Content-Range` / `截断`），绝不要用 `WORKERS=1` 归因。**
@@ -570,8 +571,8 @@ certutil -hashfile "下载到的文件路径" SHA256
 
 **若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**（且失败消息确实指向 `写入失败` 本身，见 Step 3 归因表；
 若失败消息是 `期望 206` / `Content-Range` / `截断`，那是镜像侧缺陷，不适用本条）：
-架构判定为**通过**，但 Task 2 之后的 `sink.write()` 必须实现串行化（Global Constraints 已要求），
-计划按此继续。
+架构判定为**通过**，且 `sink.write()` 必须保证「按绝对 offset 写入、结果与完成顺序无关」
+（Global Constraints 已要求：必须 await + 携带绝对 position）。计划按此继续。
 
 **不通过** → 停止，回报用户，改走 IndexedDB 拼装或顺序写入方案，本计划需重写。
 
@@ -715,7 +716,7 @@ export interface Mirror {
 
 /** 下载落盘目标。实现可以是 FSA，也可以是内存回退。 */
 export interface Sink {
-  /** 从文件顶部起 position 字节处写入 data。实现必须串行化，调用方会 await。 */
+  /** 在文件顶部起 position 字节处写入 data。调用方会 await；写入按绝对 position 定位，与完成顺序无关。 */
   write(position: number, data: Uint8Array): Promise<void>;
   close(): Promise<void>;
   abort(): Promise<void>;
