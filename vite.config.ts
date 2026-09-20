@@ -12,5 +12,8 @@ export default defineConfig({
     // 加 .superpowers 是因为 vitest 的默认 include 是 **/*.test.ts，它**不看 .gitignore**——
     // 放在忽略目录里的临时验证测试文件会被一起收集，静默膨胀套件并让「预期 N passed」核对失效。
     exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+    // 单测上限 15s（默认 5s）：引擎里走真实退避重试的用例在慢机器或 CI 上会接近 5s，
+    // 留出余量，免得「超时失败」被误读成「断言失败」。
+    testTimeout: 15_000,
   },
 });

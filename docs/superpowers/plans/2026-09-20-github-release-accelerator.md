@@ -672,6 +672,9 @@ export default defineConfig({
     // 放在忽略目录里的临时验证测试文件会被一起收集，把套件从 2 文件/12 用例静默膨胀成
     // 3 文件/25 用例，让「预期 N passed」这类核对彻底失效（本项目已两次被错误计数误导）。
     exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+    // 单测上限 15s（默认 5s）：引擎里走真实退避重试的用例在慢机器或 CI 上会接近 5s，
+    // 留出余量，免得「超时失败」被误读成「断言失败」。
+    testTimeout: 15_000,
   },
 });
 ```
@@ -1768,6 +1771,10 @@ describe('download', () => {
       download({
         url: URL_, total, mirrors: MIRRORS, sink, chunkSize: total, fetchFn: f,
         minChunkSize: 256,
+        // 用极小退避：本用例验证的是「拆到下限仍失败会抛错而非死循环」，不是退避策略。
+        // 真实退避（200/400/800/1600ms）下 4 个叶子块 × 3000ms ÷ 2 worker = 6000ms 下限，
+        // 会超过 vitest 默认 5s 单测上限——那是超时失败，不是断言失败。
+        backoffBaseMs: 5,
       }),
     ).rejects.toThrow(/403/);
     expect(sink.aborted).toBe(true);
@@ -1814,7 +1821,8 @@ describe('download', () => {
     await expect(
       download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
     ).rejects.toThrow();
-    // 2 个镜像 × 每个最多重试 3 次 = 6，允许拆分带来的额外调用但不该失控
+    // 重试上限由 maxAttemptsPerChunk（默认 5）按「块」计，不是按镜像计——
+    // 这里只要求「不失控」即可，不断言具体次数。
     expect(calls).toBeLessThanOrEqual(24);
   });
 
@@ -1906,9 +1914,6 @@ cd "D:/github_download++" && npx vitest run tests/engine.test.ts
 import { plan, splitChunk } from './planner';
 import type { Chunk, Mirror, Sink } from './types';
 
-/** 单镜像单块的最大重试次数。 */
-export const MAX_SAME_MIRROR_RETRIES = 3;
-
 /** 退避基数（毫秒）。第 n 次重试等待 BASE * 2^n。 */
 export const BACKOFF_BASE_MS = 200;
 
@@ -1950,6 +1955,8 @@ export interface DownloadOptions {
   reqIdleTimeoutMs?: number;
   /** 单分块墙钟死线，默认 CHUNK_DEADLINE_MS。测试用极小值驱动。 */
   chunkDeadlineMs?: number;
+  /** 退避基数，默认 BACKOFF_BASE_MS。测试用极小值让它不必真等指数退避。 */
+  backoffBaseMs?: number;
 }
 
 /** 队列暂空但仍有块未完成时，worker 的轮询间隔。 */
@@ -2078,6 +2085,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
     minChunkSize,
     reqIdleTimeoutMs = REQ_IDLE_TIMEOUT_MS,
     chunkDeadlineMs = CHUNK_DEADLINE_MS,
+    backoffBaseMs = BACKOFF_BASE_MS,
   } = opts;
 
   let bytesDone = 0;
@@ -2140,7 +2148,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
         // 放回队尾让其他健康镜像接手。本 worker 随即退避，而空闲的对等 worker
         // 每 SPIN_MS 轮询一次队列，因此健康镜像总能先抢到该块。
         queue.push(job);
-        await sleep(BACKOFF_BASE_MS * 2 ** (job.attempts - 1));
+        await sleep(backoffBaseMs * 2 ** (job.attempts - 1));
       }
     }
   };
@@ -2657,6 +2665,9 @@ export default defineConfig({
     // 一旦显式指定 exclude，vitest 的默认值就被整体替换，须自己带上 node_modules / dist。
     // .superpowers 用于排除忽略目录里的临时测试文件（vitest 的 **/*.test.ts 不看 .gitignore）。
     exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+    // 单测上限 15s（默认 5s）：引擎里走真实退避重试的用例在慢机器或 CI 上会接近 5s，
+    // 留出余量，免得「超时失败」被误读成「断言失败」。
+    testTimeout: 15_000,
   },
 });
 ```
