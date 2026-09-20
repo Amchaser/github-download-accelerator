@@ -2676,12 +2676,55 @@ import type { Sink } from './types';
 import * as ui from './ui';
 
 /** 单连接回退：整体下载后用 <a download> 保存。无并行、无断点，仅保可用性。 */
-async function fallbackDownload(url: string, mirrorPrefix: string, filename: string): Promise<void> {
+async function fallbackDownload(url: string, mirrorPrefix: string, filename: string, total: number): Promise<void> {
   ui.log('使用单连接回退模式（无并行加速）…');
-  const res = await fetch(mirrorPrefix + url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const blob = await res.blob();
-  const href = URL.createObjectURL(blob);
+  // **单连接同样必须有界。** 引擎为每个分块都配了空闲超时 + 墙钟死线，正是因为**实测**
+  // 过镜像会滴水式卡住（两次 500MB 停在 98.x%、字节数仍在极慢增长）。这条路径若设限不设，
+  // 连接一停就永远停在「下载中…」、按钮一直不可用也取消不了——正是本项目最想消灭的形态。
+  // 顺带用流式读取补上进度：不这样做，用户在整个传输期间只看得到一个冻结的日志。
+  const IDLE_MS = 30_000;
+  const ac = new AbortController();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => ac.abort(), IDLE_MS);
+  };
+  let href = '';
+  try {
+    armIdle();
+    const res = await fetch(mirrorPrefix + url, { signal: ac.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.body) throw new Error('响应没有 body');
+    const reader = res.body.getReader();
+    // 一次性按已知总长分配（而不是用不断增长的 parts 数组再拼 Blob）：
+    // 既避免双份占用，也让类型落在 `Uint8Array<ArrayBuffer>` 上——TS 的 BlobPart
+    // 要求 ArrayBuffer，而 reader 给出的 Uint8Array 是 ArrayBufferLike（可能含
+    // SharedArrayBuffer），直接放进 Blob 会类型不符，且不该用 cast 掩盖。
+    const buf = new Uint8Array(total);
+    let got = 0;
+    for (;;) {
+      armIdle();
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        if (got + value.byteLength > total) {
+          throw new Error(`响应超出预期长度：已收 ${got + value.byteLength}，应为 ${total}`);
+        }
+        buf.set(value, got);
+        got += value.byteLength;
+        ui.setProgress(got, total);
+      }
+    }
+    if (got !== total) throw new Error(`字节数不足：期望 ${total}，实收 ${got}`);
+    href = URL.createObjectURL(new Blob([buf]));
+  } catch (e) {
+    if (ac.signal.aborted) {
+      throw new Error(`连接空闲超过 ${IDLE_MS / 1000}s（疑似镜像滴水式限速或已断），已中止`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(idleTimer);
+  }
   const a = document.createElement('a');
   a.href = href;
   a.download = filename;
@@ -2731,14 +2774,22 @@ async function run(): Promise<void> {
 
   let sink: Sink;
   if (supportsFsa()) {
-    sink = await createFsaSink(meta.filename);
+    try {
+      sink = await createFsaSink(meta.filename);
+    } catch (e) {
+      // 用户取消保存对话框时 showSaveFilePicker 以 DOMException(AbortError) 拒绝——
+      // 这是**用户主动取消，不是失败**，不该在日志里报失败。
+      // 但特判必须**只罩住这一处**：原先它罩住整个 run()，会把下载中途其它来源的
+      // AbortError 也吞掉，并谎称「本次下载未开始」（此时下载其实早已开始）。
+      throw e;
+    }
     // FSA 的写入先进临时文件，只有 close() 才把内容换到用户选定的路径上。于是**整个
     // 下载期间目标文件都是 0 字节**，最后一次性出现——不预先说明的话，人看着一个
     // 0 字节文件会合理地以为卡住了。
     ui.log('说明：目标文件在下载过程中会一直显示 0 字节，下载完毕才一次性写入内容（浏览器先写临时文件）。');
   } else {
     ui.showWarning('当前浏览器不支持 File System Access API，将使用单连接回退模式。建议改用 Chrome / Edge。');
-    await fallbackDownload(raw, best.prefix, meta.filename);
+    await fallbackDownload(raw, best.prefix, meta.filename, meta.total);
     ui.log('已触发保存。');
     return;
   }
@@ -2746,7 +2797,7 @@ async function run(): Promise<void> {
   if (!meta.acceptRanges) {
     ui.log('上游不支持 Range，降级为单连接下载…');
     await sink.abort();
-    await fallbackDownload(raw, best.prefix, meta.filename);
+    await fallbackDownload(raw, best.prefix, meta.filename, meta.total);
     return;
   }
 
