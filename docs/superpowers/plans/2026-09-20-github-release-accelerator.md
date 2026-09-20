@@ -604,14 +604,16 @@ cd "D:/github_download++" && npm init -y && npm i -D typescript vite vitest @typ
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "vite.config.ts"]
 }
 ```
 
 `vite.config.ts`：
 
 ```ts
-import { defineConfig } from 'vite';
+// 必须从 'vitest/config' 引入 defineConfig，不能从 'vite'：
+// vite 的 UserConfig 类型不认识 `test` 键，从 'vite' 引入会让该键失去类型检查。
+import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   root: '.',
@@ -2369,7 +2371,8 @@ cd "D:/github_download++" && git add -A && git commit -m "feat: 单页界面与�
 修改 `vite.config.ts`，加入 `base`。仓库名已定：**`github-download-accelerator`**（原目录名 `github_download++` 含 `+`，GitHub 仓库名不允许该字符）：
 
 ```ts
-import { defineConfig } from 'vite';
+// 同 Task 2：从 'vitest/config' 引入，否则 `test` 键失去类型检查。
+import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   root: '.',
