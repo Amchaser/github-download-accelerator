@@ -2968,7 +2968,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 必须 24（或 22），不能是 20：vitest 5 的 engines 为
+          # ^22.12.0 || ^24.0.0 || >=26.0.0，Node 20 不在支持范围，npm test 会当场失败。
+          node-version: '24'
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -3014,7 +3016,7 @@ cd "D:/github_download++" && git push -u origin main
 
 - [ ] **Step 5: 验证线上可用**
 
-等 Actions 跑完，打开 `https://zhuiluo.github.io/github-download-accelerator/`，用 Task 9 的同一条链接重跑一次，确认功能与本地一致。
+等 Actions 跑完，打开 `https://amchaser.github.io/github-download-accelerator/`，用 Task 9 的同一条链接重跑一次，确认功能与本地一致。
 
 ---
 

@@ -4,6 +4,10 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   root: '.',
+  // GitHub Pages 的项目站点挂在 /<仓库名>/ 子路径下，不是域名根。
+  // 缺了这一行，构建出的 index.html 会去根路径找资源 → 线上白屏（本地 dev 一切正常，
+  // 所以这个坑只在部署后才现形）。
+  base: '/github-download-accelerator/',
   build: { outDir: 'dist' },
   test: {
     globals: true,

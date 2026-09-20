@@ -1,0 +1,51 @@
+# GitHub Pages 自动部署。
+#
+# 触发分支是 main：本地历史分支名原为 master，推送前已改名以对齐 GitHub 默认分支。
+# 若二者不一致，工作流**永远不会触发**，且不报任何错——Actions 页面一片空白，无从判断。
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 必须是 24（或 22），**不能是 20**：vitest 5 的 engines 是
+          # ^22.12.0 || ^24.0.0 || >=26.0.0，Node 20 直接不在支持范围内，
+          # 下面那步 npm test 会当场失败。vite 8 要求 ^20.19.0 || >=22.12.0。
+          # 取 24 是为了与本机验证环境一致（本机 v24.16.0，全套测试通过）。
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
