@@ -12,48 +12,74 @@ const CHUNK = 8 * 1024 * 1024;
 const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
 
 document.getElementById('go').onclick = async () => {
-  const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' } });
-  const total = Number(res0.headers.get('content-range').split('/')[1]);
-  log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
-
-  const handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
-  const stream = await handle.createWritable();
-
-  const t0 = performance.now();
-  let done = 0, peakHeap = 0;
-  const ranges = [];
-  for (let s = 0; s < total; s += CHUNK) ranges.push([s, Math.min(s + CHUNK, total) - 1]);
-  log(`chunks = ${ranges.length}`);
-
-  let next = 0;
-  async function worker(prefix) {
-    while (next < ranges.length) {
-      const [start, end] = ranges[next++];
-      const res = await fetch(prefix + URL_, { headers: { Range: `bytes=${start}-${end}` } });
-      if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
-      const reader = res.body.getReader();
-      let pos = start;
-      for (;;) {
-        const { done: d, value } = await reader.read();
-        if (d) break;
-        await stream.write({ type: 'write', position: pos, data: value });
-        pos += value.length;
-        done += value.length;
-      }
-      if (pos !== end + 1) throw new Error(`short chunk: ${pos} != ${end + 1}`);
-      peakHeap = Math.max(peakHeap, performance.memory?.usedJSHeapSize ?? 0);
-      const secs = (performance.now() - t0) / 1000;
-      log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${(peakHeap / 1048576).toFixed(0)}MiB`);
-    }
+  // showSaveFilePicker 依赖用户手势的瞬时激活（Chrome 约 5 秒），
+  // 因此它必须排在所有 await 之前。若先等镜像探测再调用，激活会过期并抛
+  // SecurityError，表现为「点了没反应」——极易被误判成 FSA 不可行。
+  // 这是本 spike 唯一的假阴性来源。
+  let stream;
+  let heapTimer; // 声明在 try 之外，catch 里才能 clearInterval
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
+    stream = await handle.createWritable();
+  } catch (e) {
+    log(`无法创建文件: ${e.name} ${e.message}`);
+    log('若为 SecurityError，是用户激活过期（非 FSA 问题），重新点一次即可。');
+    return;
   }
 
   try {
+    const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' } });
+    const cr = res0.headers.get('content-range');
+    if (res0.status !== 206 || !cr) {
+      throw new Error(`探针失败 status=${res0.status} content-range=${cr}（镜像问题，非 FSA 问题）`);
+    }
+    const total = Number(cr.split('/')[1]);
+    log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
+
+    const t0 = performance.now();
+    let done = 0, peakHeap = 0;
+    // 独立定时采样峰值堆。只在分块边界采样会漏掉块内瞬时累积，
+    // 而「堆是否随下载字节数线性增长」正是本 spike 的判定标准之一。
+    heapTimer = setInterval(() => {
+      const h = performance.memory && performance.memory.usedJSHeapSize;
+      if (h) peakHeap = Math.max(peakHeap, h);
+    }, 100);
+
+    const ranges = [];
+    for (let s = 0; s < total; s += CHUNK) ranges.push([s, Math.min(s + CHUNK, total) - 1]);
+    log(`chunks = ${ranges.length}`);
+
+    let next = 0;
+    async function worker(prefix) {
+      while (next < ranges.length) {
+        const [start, end] = ranges[next++];
+        const res = await fetch(prefix + URL_, { headers: { Range: `bytes=${start}-${end}` } });
+        if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
+        const reader = res.body.getReader();
+        let pos = start;
+        for (;;) {
+          const { done: d, value } = await reader.read();
+          if (d) break;
+          await stream.write({ type: 'write', position: pos, data: value });
+          pos += value.length;
+          done += value.length;
+        }
+        if (pos !== end + 1) throw new Error(`short chunk: ${pos} != ${end + 1}`);
+        const secs = (performance.now() - t0) / 1000;
+        const nowHeap = (performance.memory ? performance.memory.usedJSHeapSize : 0) / 1048576;
+        log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${nowHeap.toFixed(0)}MiB peak=${(peakHeap / 1048576).toFixed(0)}MiB`);
+      }
+    }
+
     await Promise.all(MIRRORS.map(worker));
+    clearInterval(heapTimer);
     await stream.close();
     const secs = (performance.now() - t0) / 1000;
     log(`完成: ${(total / 1048576 / secs).toFixed(2)} MiB/s, 峰值堆 ${(peakHeap / 1048576).toFixed(0)} MiB`);
+    if (!performance.memory) log('注意: 本浏览器无 performance.memory，heap 读数无效（须用 Chrome/Edge）');
   } catch (e) {
-    await stream.abort();
+    clearInterval(heapTimer);
+    try { await stream.abort(); } catch {}
     log(`失败: ${e.message}`);
   }
 };
