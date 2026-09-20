@@ -75,6 +75,17 @@ const CANDIDATES = [
   'https://ghproxy.link/',
   'https://gh.api.99988866.xyz/',
 
+  // ── 2026-09-20 第二批（搜索补充 + 社区常见）──────────────────────────
+  'https://gh.noki.eu.org/',
+  'https://gh-proxy.net/',
+  'https://ghproxy.cn/',
+  'https://gh.6yit.com/',
+  'https://gh.abboys.cn/',
+  'https://gh.zzz.re/',
+  'https://gh.yuchao.wang/',
+  'https://ghp.arislee.workers.dev/',
+  'https://gh.imbaba.eu.org/',
+
   // ── 历史上有 Range 但缺 CORS；留着以便哪天补上能被自动发现 ──────────
   'https://gh-proxy.com/',
   'https://ghproxy.net/',
