@@ -23,6 +23,12 @@
 - **能力检测必须检测 `createWritable`**，而非仅检测 `showSaveFilePicker`。
 - 目标浏览器：Chromium 内核（Chrome / Edge / Opera）。Firefox 与 Safari 走 `<a download>` 回退路径。
 - 所有源码文件用 TypeScript，`strict: true`。
+- **计划里「预期：N passed」这类断言是提示，不是目标。** 实测数字与之不符时，
+  先逐条核对 brief 列出的用例清单，判断是 brief 写错了还是自己漏写了；
+  **绝不要为了凑数字去添加、删改或跳过用例**——那会把一个文档缺陷变成一个真实的测试缺口。
+  本项目已多次被硬编码预期误导：Task 3 的计数错了两次、Task 5 错一次；
+  措辞类预期（例如报错文案）还会随依赖大版本变化（vitest 5 报 `Cannot find module`，
+  vitest 3 及更早报 `Failed to resolve import`），不要因措辞不同就以为出了别的问题。
 - **每个 Range 分块必须有「墙钟」死线，不能只靠空闲超时。**（2026-09-20 实测得出）
   某镜像会**滴水式限速**——每几秒吐少量字节。这同时重置了空闲超时与进度看门狗
   （两者都只判断「有没有动」），于是把下载无限期拖住：两次 500MB 实测都停在 98.x%，
