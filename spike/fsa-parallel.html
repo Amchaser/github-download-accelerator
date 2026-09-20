@@ -95,6 +95,7 @@ document.getElementById('go').onclick = async () => {
   let handle;
   let stream;
   let heapTimer;            // 声明在 try 之外，catch 里才能 clearInterval
+  let watchdog;             // 同上：若用 const 声明在 try 内，catch 里引用会 ReferenceError 吞掉失败消息
   let aborted = false;      // 声明在 try 之外，catch 里置位，让其余 worker 立即停手
   // peakHeap / sampleHeap 也必须声明在 try 之外：失败路径同样要报出峰值堆。
   // [收尾] 失败（close 时才落盘、磁盘满时报错）恰恰是「关闭时才落盘」的峰值所在，
@@ -150,6 +151,29 @@ document.getElementById('go').onclick = async () => {
     log(`chunks = ${ranges.length}`);
 
     let next = 0;
+
+    // 全局进度看门狗。每个 await 都有 30s 上限，但若某次 abort 没能打断正在进行的
+    // 流读取（非标准 Chromium 内核可能如此），就会永久静默——而「失败必须可归因」
+    // 正是本 spike 的核心要求，静默停住是它唯一报不出来的形态。
+    // 用独立墙钟：只要字节数长时间不增长就响亮报错，并点名在途请求数。
+    // 阈值 45s > 单请求 30s，所以正常情况下不会与既有超时抢答。
+    let lastSeenDone = -1;
+    let lastProgressAt = performance.now();
+    const WATCHDOG_MS = 45000;
+    watchdog = setInterval(() => {
+      if (done !== lastSeenDone) {
+        lastSeenDone = done;
+        lastProgressAt = performance.now();
+        return;
+      }
+      const idle = (performance.now() - lastProgressAt) / 1000;
+      if (idle < WATCHDOG_MS / 1000) return;
+      aborted = true;
+      for (const a of inflight) { try { a.abort(); } catch (e) {} }
+      log(`[看门狗] 已有 ${idle.toFixed(0)}s 没有任何字节进展，判定为停住（在途请求 ${inflight.size} 个）。`);
+      log('[看门狗] 这多半不是定位写入的问题，而是某个镜像的流卡住、或浏览器没把 abort 传导到流读取。');
+      log('[看门狗] 若当前不是真正的 Chrome/Edge（如 360、QQ 等套壳内核），请换 Chrome/Edge 重跑再下结论。');
+    }, 2000);
 
     // 所有抛出的错误都带上「镜像 prefix + 精确字节区间」，
     // 这样 4 个异构镜像里某一个退化（忽略 Range 回 200、或中途断连）才能与
@@ -234,6 +258,11 @@ document.getElementById('go').onclick = async () => {
     if (WORKERS > MIRRORS.length) log(`注意: WORKERS=${WORKERS} 超过镜像数 ${MIRRORS.length}，实际只用 ${prefixes.length} 个 worker`);
     log(`实际启动 worker 数 = ${prefixes.length}`);
     await Promise.all(prefixes.map(worker));
+    clearInterval(watchdog);
+    // close() 阶段没有任何进度输出（done 不再增长，看门狗已停），但 500MB 的落盘 +
+    // 原子替换可能要等一会。明确说出来，避免把「正在落盘」误判成「卡死」——
+    // 这个混淆在实测中真实发生过。
+    log('全部分块已下载完成，正在落盘（close）—— 此阶段没有进度输出，可能会静默一会，请等待「完成」行。');
 
     // 采样必须一直覆盖到 close()：createWritable() 若在 close 时才真正落盘，
     // 真实峰值出现在关闭期间，提前 clearInterval 会把峰值读平 → 假 PASS。
@@ -270,6 +299,7 @@ document.getElementById('go').onclick = async () => {
     aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
     sampleHeap();                          // 失败前最后采一次，让下面的 peak 覆盖到失败时刻
     clearInterval(heapTimer);
+    clearInterval(watchdog);
     for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
     log(`失败: ${e && e.message}  peak=${fmtHeap(peakHeap)}`);
