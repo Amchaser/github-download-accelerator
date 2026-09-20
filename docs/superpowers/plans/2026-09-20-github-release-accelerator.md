@@ -55,17 +55,48 @@
 const URL_ = 'https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe';
 const MIRRORS = ['https://gh.xmly.dev/', 'https://gh.xxooo.cf/', 'https://gh.ddlc.top/', 'https://gh.monlor.com/'];
 const CHUNK = 8 * 1024 * 1024;
+const WORKERS = 4;              // 并发 worker 数（= 占用前几个镜像）。可改成 1 做并发归因，见日志面板说明。
+const REQ_TIMEOUT_MS = 30000;   // 单请求超时，镜像挂住时必须响亮失败而不是静默停住
 const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
 
+const HAS_MEM = typeof performance !== 'undefined' && !!performance.memory;
+// 无 performance.memory 时一律打印 N/A。打印 0MiB 会被读成「内存极好」——那是假 PASS。
+const fmtHeap = (bytes) => HAS_MEM ? `${(bytes / 1048576).toFixed(0)}MiB` : 'N/A';
+
 document.getElementById('go').onclick = async () => {
+  // 先在运行最开始、无条件地交代度量口径与归因方法，
+  // 这样无论后面是成功还是失败，读日志的人都知道该怎么读这些数字。
+  log(`WORKERS = ${WORKERS}（并发 worker 数；镜像白名单共 ${MIRRORS.length} 个）`);
+  log(`镜像: ${MIRRORS.join(' , ')}`);
+  log(`块大小 = ${CHUNK / 1048576} MiB，单请求超时 = ${REQ_TIMEOUT_MS / 1000}s`);
+  log('[MEMORY] 下面的 heap/peak 只是渲染进程 V8 JS 堆的读数：TypedArray/ArrayBuffer 后备存储至多被部分计入，');
+  log('[MEMORY] 而 FSA 写入管线与网络缓冲都活在浏览器进程里，performance.memory 完全看不到它们。');
+  log('[MEMORY] 因此这个数字无法排除「整个浏览器进程的内存随文件大小增长」。');
+  log('[MEMORY] 人工必须另开 Chrome 任务管理器（Shift+Esc），在下载前 / 下载中 / 下载后各记录一次本标签页内存，三项都写进结论。');
+  if (!HAS_MEM) log('[MEMORY] 本环境没有 performance.memory：本次 heap=N/A peak=N/A —— 这是「测不到」，不是「内存优秀」。须用 Chrome/Edge 重跑。');
+  log(`[并发归因] 若本次以 WORKERS=${WORKERS} 失败，请把脚本顶部的 WORKERS 改成 1 后重跑（其余步骤不变）：`);
+  log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
+  log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+
+  // 特性预检：非 Chromium / 非安全上下文时应报「环境不支持」，
+  // 而不是抛 TypeError 之后再补一句 SecurityError 的提示，把不支持的环境带进重试死循环。
+  if (typeof window.showSaveFilePicker !== 'function') {
+    log('无法创建文件: 本环境没有 window.showSaveFilePicker。');
+    log('本 spike 需要 Chromium 内核浏览器（Chrome / Edge），且页面必须经 http://localhost 提供；file:// 不是可靠的安全上下文，Firefox / Safari 也不支持该 API。');
+    return;
+  }
+
   // showSaveFilePicker 依赖用户手势的瞬时激活（Chrome 约 5 秒），
   // 因此它必须排在所有 await 之前。若先等镜像探测再调用，激活会过期并抛
   // SecurityError，表现为「点了没反应」——极易被误判成 FSA 不可行。
   // 这是本 spike 唯一的假阴性来源。
+  let handle;
   let stream;
-  let heapTimer; // 声明在 try 之外，catch 里才能 clearInterval
+  let heapTimer;            // 声明在 try 之外，catch 里才能 clearInterval
+  let aborted = false;      // 声明在 try 之外，catch 里置位，让其余 worker 立即停手
+  const inflight = new Set(); // 在途请求的 AbortController，失败时统一取消
   try {
-    const handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
+    handle = await window.showSaveFilePicker({ suggestedName: 'spike.bin' });
     stream = await handle.createWritable();
   } catch (e) {
     log(`无法创建文件: ${e.name} ${e.message}`);
@@ -74,59 +105,137 @@ document.getElementById('go').onclick = async () => {
   }
 
   try {
-    const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' } });
-    const cr = res0.headers.get('content-range');
-    if (res0.status !== 206 || !cr) {
-      throw new Error(`探针失败 status=${res0.status} content-range=${cr}（镜像问题，非 FSA 问题）`);
+    // ---- 探针阶段：单独标 [探针]，与下载阶段的失败区分开 ----
+    // 否则一次纯网络失败会以裸 TypeError 的形式出现在 stream 已打开之后，读起来像下载失败。
+    let total;
+    try {
+      const res0 = await fetch(MIRRORS[0] + URL_, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
+      const cr = res0.headers.get('content-range');
+      if (res0.status !== 206) {
+        throw new Error(`status=${res0.status}（该镜像未返回 206，可能不遵守 Range 或已失效）`);
+      }
+      if (!cr || !cr.startsWith('bytes 0-0/')) {
+        throw new Error(`Content-Range=${JSON.stringify(cr)} 前缀不等于 "bytes 0-0/"`);
+      }
+      total = Number(cr.split('/')[1]);
+      if (!Number.isFinite(total) || total <= 0) {
+        throw new Error(`Content-Range=${JSON.stringify(cr)} 解析出的 total=${cr.split('/')[1]} 不是正有限数`);
+      }
+    } catch (e) {
+      throw new Error(`[探针] 镜像 ${MIRRORS[0]} 请求 bytes=0-0 失败: ${e.message}（镜像/网络问题，与 FSA 无关）`);
     }
-    const total = Number(cr.split('/')[1]);
     log(`total = ${total} (${(total / 1048576).toFixed(1)} MiB)`);
 
     const t0 = performance.now();
     let done = 0, peakHeap = 0;
     // 独立定时采样峰值堆。只在分块边界采样会漏掉块内瞬时累积，
     // 而「堆是否随下载字节数线性增长」正是本 spike 的判定标准之一。
-    heapTimer = setInterval(() => {
-      const h = performance.memory && performance.memory.usedJSHeapSize;
-      if (h) peakHeap = Math.max(peakHeap, h);
-    }, 100);
+    const sampleHeap = () => {
+      if (!HAS_MEM) return;
+      const h = performance.memory.usedJSHeapSize;
+      if (Number.isFinite(h) && h > 0) peakHeap = Math.max(peakHeap, h);
+    };
+    heapTimer = setInterval(sampleHeap, 100);
+    sampleHeap();
 
     const ranges = [];
     for (let s = 0; s < total; s += CHUNK) ranges.push([s, Math.min(s + CHUNK, total) - 1]);
     log(`chunks = ${ranges.length}`);
 
     let next = 0;
+
+    // 所有抛出的错误都带上「镜像 prefix + 精确字节区间」，
+    // 这样 4 个异构镜像里某一个退化（忽略 Range 回 200、或中途断连）才能与
+    // 「并行定位写入不被支持」区分开——否则失败不可归因。
     async function worker(prefix) {
-      while (next < ranges.length) {
+      while (!aborted && next < ranges.length) {
         const [start, end] = ranges[next++];
-        const res = await fetch(prefix + URL_, { headers: { Range: `bytes=${start}-${end}` } });
-        if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
-        const reader = res.body.getReader();
-        let pos = start;
-        for (;;) {
-          const { done: d, value } = await reader.read();
-          if (d) break;
-          await stream.write({ type: 'write', position: pos, data: value });
-          pos += value.length;
-          done += value.length;
+        const ac = new AbortController();
+        inflight.add(ac);
+        // 空闲超时：每个请求独立计时，且每次读到一个数据块就重新计时。
+        // 于是镜像「挂住不动」超过 REQ_TIMEOUT_MS 必定响亮失败——不会不再出进度行、
+        // 变成无法归因的停住；同时也不会误杀只是慢、但一直在出数据的镜像。
+        let tid;
+        const arm = () => { clearTimeout(tid); tid = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS); };
+        try {
+          arm();
+          let res;
+          try {
+            res = await fetch(prefix + URL_, {
+              headers: { Range: `bytes=${start}-${end}` },
+              cache: 'no-store',   // 302 落点是限时签名 URL，禁止缓存
+              signal: ac.signal,
+            });
+          } catch (e) {
+            throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 请求失败/超时: ${e.name} ${e.message}`);
+          }
+          if (res.status !== 206) {
+            throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end}: 期望 206，实际 ${res.status}（该镜像忽略了 Range 或已失效；不要把整包写入部分文件）`);
+          }
+          const cr = res.headers.get('content-range');
+          const want = `bytes ${start}-${end}/`;
+          if (!cr || !cr.startsWith(want)) {
+            throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end}: Content-Range=${JSON.stringify(cr)} 前缀不等于 ${JSON.stringify(want)}`);
+          }
+          const reader = res.body.getReader();
+          let pos = start;
+          for (;;) {
+            if (aborted) throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 因其它镜像先失败而中止`);
+            arm();
+            let r;
+            try {
+              r = await reader.read();
+            } catch (e) {
+              throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 流中断/超时（已读到 ${pos}）: ${e.name} ${e.message}`);
+            }
+            if (r.done) break;
+            try {
+              await stream.write({ type: 'write', position: pos, data: r.value });
+            } catch (e) {
+              throw new Error(`[下载] 写入失败: 镜像 ${prefix} 区块 bytes=${start}-${end} 位置 ${pos}: ${e.name} ${e.message}`);
+            }
+            pos += r.value.length;
+            done += r.value.length;
+          }
+          if (pos !== end + 1) {
+            throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 截断: 已读到 ${pos}，应为 ${end + 1}`);
+          }
+          const secs = (performance.now() - t0) / 1000;
+          const nowHeap = HAS_MEM ? performance.memory.usedJSHeapSize : 0;
+          log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${fmtHeap(nowHeap)} peak=${fmtHeap(peakHeap)}`);
+        } finally {
+          clearTimeout(tid);
+          inflight.delete(ac);
         }
-        if (pos !== end + 1) throw new Error(`short chunk: ${pos} != ${end + 1}`);
-        const secs = (performance.now() - t0) / 1000;
-        const nowHeap = (performance.memory ? performance.memory.usedJSHeapSize : 0) / 1048576;
-        log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${nowHeap.toFixed(0)}MiB peak=${(peakHeap / 1048576).toFixed(0)}MiB`);
       }
     }
 
-    await Promise.all(MIRRORS.map(worker));
-    clearInterval(heapTimer);
+    const prefixes = MIRRORS.slice(0, WORKERS);
+    if (WORKERS > MIRRORS.length) log(`注意: WORKERS=${WORKERS} 超过镜像数 ${MIRRORS.length}，实际只用 ${prefixes.length} 个 worker`);
+    log(`实际启动 worker 数 = ${prefixes.length}`);
+    await Promise.all(prefixes.map(worker));
+
+    // 采样必须一直覆盖到 close()：createWritable() 若在 close 时才真正落盘，
+    // 真实峰值出现在关闭期间，提前 clearInterval 会把峰值读平 → 假 PASS。
     await stream.close();
+    sampleHeap();              // close 之后（可能的 flush 之后）再补一次读数
+    clearInterval(heapTimer);  // 到这里才停采样，覆盖范围包含 close 完成之后
+
     const secs = (performance.now() - t0) / 1000;
-    log(`完成: ${(total / 1048576 / secs).toFixed(2)} MiB/s, 峰值堆 ${(peakHeap / 1048576).toFixed(0)} MiB`);
-    if (!performance.memory) log('注意: 本浏览器无 performance.memory，heap 读数无效（须用 Chrome/Edge）');
+    log(`完成: ${(total / 1048576 / secs).toFixed(2)} MiB/s, 峰值堆 ${fmtHeap(peakHeap)}`);
+
+    // 自证大小：让「文件字节数正确」直接出现在日志里，不必人工去翻分块日志。
+    // 只读 .size —— 这是 500MB 文件，禁止把响应体整块缓冲进内存（见 Global Constraints 热路径禁令）。
+    const written = (await handle.getFile()).size;
+    log(written === total
+      ? `[大小校验] PASS: 落盘文件 ${written} 字节 === total ${total}`
+      : `[大小校验] FAIL: 落盘文件 ${written} 字节 !== total ${total}`);
   } catch (e) {
+    aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
     clearInterval(heapTimer);
+    for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
-    log(`失败: ${e.message}`);
+    log(`失败: ${e && e.message}`);
   }
 };
 </script>
@@ -136,9 +245,14 @@ document.getElementById('go').onclick = async () => {
 
 > **为什么 `showSaveFilePicker` 必须排在所有 `await` 之前：** 它依赖用户手势的「瞬时激活」，
 > Chrome 里这个窗口约 5 秒。若先等镜像探测再调用，激活会过期并抛 `SecurityError`，
-> 表现为「点了没反应」——极易被误判成 FSA 不可行。**这是本 spike 唯一的假阴性来源，
-> 务必保持这个调用顺序。** 同理，探针与下载都包在 `try` 里，任何失败都会写进日志面板，
+> 表现为「点了没反应」——极易被误判成 FSA 不可行。**这是本 spike 最容易踩的假阴性，
+> 务必保持这个调用顺序**（特性预检 `typeof window.showSaveFilePicker !== 'function'` 排在它前面，
+> 但那只是属性读取，不消耗激活）。同理，探针与下载都包在 `try` 里，任何失败都会写进日志面板，
 > 不会出现「空白日志」这种无法归因的结果。
+>
+> **失败必须可归因：** 日志里每一条 `失败:` 都带 `[探针]` 或 `[下载]` 前缀，并附上具体的镜像 URL
+> 与字节区间。4 个异构镜像里某个退化（忽略 Range 回 200、中途断连、挂住）会因此与
+> 「并行定位写入不被支持」区分开——**判读结论前必须先看前缀**，否则会把一次镜像故障误判成架构不成立。
 
 - [ ] **Step 2: 起本地服务器并打开**
 
@@ -152,11 +266,24 @@ cd "D:/github_download++/spike" && python -m http.server 8000
 
 - [ ] **Step 3: 跑并记录**
 
-点击「开始」，选择保存位置，等待完成。记录三个数据：
+**先取内存基线。** 打开 Chrome 任务管理器（`Shift+Esc`），在点击开始**之前**记下本标签页的内存。
+
+页面日志里的 `heap=` / `peak=` **只是渲染进程 V8 JS 堆的读数**：TypedArray/ArrayBuffer 后备存储至多被部分
+计入，而 FSA 写入管线与网络缓冲都活在浏览器进程里，`performance.memory` 根本看不到它们。
+**所以这个数字无法排除「整个浏览器进程的内存随文件大小增长」**——它必须由人工用任务管理器交叉验证，
+否则「峰值堆两百 MiB」会被读成一个并不成立的结论。
+
+点击「开始」，选择保存位置，等待完成。记录以下数据：
 
 1. **最终速度**（MiB/s）
-2. **峰值 JS 堆**（页面日志里的 `heap=`）——若随下载量线性增长，说明有累积，不通过
-3. **文件 SHA-256**
+2. **峰值 JS 堆**（页面日志里的 `peak=`）——若随下载量线性增长，说明有累积，不通过。
+   若显示 `N/A`，说明该环境没有 `performance.memory`：这是「测不到」而**不是**「内存优秀」，
+   必须改用 Chrome/Edge 重跑，不得据此判定通过。
+3. **本标签页内存的三个读数**（任务管理器）：下载**前** / 下载**中** / 下载**后**各一次。
+   若读数随下载字节数持续攀升而不是在高位附近波动后回落，说明有整包累积，不通过。
+4. **`[大小校验]` 行**：页面在 `close()` 之后会打印 `PASS` 或 `FAIL`。出现 `FAIL` 即不通过，
+   不必再算哈希。
+5. **文件 SHA-256**
 
 算 SHA-256：
 
@@ -164,15 +291,28 @@ cd "D:/github_download++/spike" && python -m http.server 8000
 certutil -hashfile "下载到的文件路径" SHA256
 ```
 
+**若失败，必须做并发归因，否则结论不可用。** 先看 `失败:` 行的前缀：`[探针]` 指镜像/网络问题
+（与 FSA 无关），`[下载]` 才是写入或区块校验问题。若前缀为 `[下载]` 且消息指向写入，把
+`spike/fsa-parallel.html` 顶部的 `const WORKERS = 4;` 改成 `1` 后原样重跑：
+
+- `WORKERS=1` **成功** ⇒ 定位写入本身可行，问题只在「并发写未串行化」（spike 里每个 worker 各自
+  `await stream.write()`，彼此并未串行）。按 Global Constraints 给 `sink.write()` 加写互斥即可救回架构，
+  **这不算本任务不通过**。
+- `WORKERS=1` **仍失败** ⇒ 定位写入本身不被支持，架构不成立，本任务不通过。
+
+两种结果都要写进结论，因为它决定后续任务的架构改法。
+
 - [ ] **Step 4: 校验正确性**
 
-预期总大小 `499558899` 字节。确认 `certutil` 输出的文件大小与之完全一致。
+预期总大小 `499558899` 字节。确认 `certutil` 输出的文件大小与之完全一致——这与页面日志里的
+`[大小校验] PASS`（`(await handle.getFile()).size === total`）是同一件事，两者不一致时以人工复核为准。
 
-再跑一次原始直链下载同一文件用于比对哈希（可选，若直连太慢可跳过，仅凭大小判断）：
+再跑一次原始直链下载同一文件用于比对哈希（可选，若直连太慢可跳过，仅凭大小判断）。
+**参照文件不要放 `/tmp`**：它在 Windows 上不是 `certutil` 能解析的路径，落到 `%USERPROFILE%\Downloads`：
 
 ```bash
-curl -skL -o /tmp/ref.exe "https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe" --max-time 300
-certutil -hashfile /tmp/ref.exe SHA256
+curl -skL -o "$USERPROFILE/Downloads/ref.exe" "https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe" --max-time 300
+certutil -hashfile "$USERPROFILE/Downloads/ref.exe" SHA256
 ```
 
 两次 SHA-256 必须一致。
@@ -180,9 +320,13 @@ certutil -hashfile /tmp/ref.exe SHA256
 - [ ] **Step 5: 判定并提交结论**
 
 **通过条件（全部满足）**：
-- SHA-256 与参照一致，或文件大小精确等于 `499558899`
+- SHA-256 与参照一致，或文件大小精确等于 `499558899`（且日志中 `[大小校验]` 为 `PASS`）
 - 速度显著优于 0.06 MB/s 的直连基线（预期 > 3 MB/s）
-- 峰值堆稳定在几百 MiB 以内，不随下载字节数线性增长
+- 峰值堆稳定在几百 MiB 以内，不随下载字节数线性增长（若 `peak=N/A`，本条由任务管理器三读数代替判定）
+- 任务管理器里本标签页内存的三个读数不随下载字节数持续攀升
+
+**若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**：架构判定为**通过**，但 Task 2 之后的
+`sink.write()` 必须实现串行化（Global Constraints 已要求），计划按此继续。
 
 **不通过** → 停止，回报用户，改走 IndexedDB 拼装或顺序写入方案，本计划需重写。
 
