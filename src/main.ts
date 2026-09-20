@@ -17,6 +17,38 @@ function isAbortError(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'AbortError';
 }
 
+/**
+ * 下载期间拦截「关闭页面」。FSA 路径下磁盘上连半成品都没有——内容全在临时文件里，
+ * 只有 close() 才把它换到目标路径（本项目实测确认：跑到 98.5% 时目标文件仍是 0 字节）。
+ * 于是关掉标签页 = 已下载的全部作废，而浏览器**默认不警告**，用户看不出代价。
+ */
+let unloadGuarded = false;
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  e.preventDefault();
+  // 规范已废弃 returnValue，但部分浏览器仍只认「它被赋过值」，故一并设置。
+  e.returnValue = '';
+}
+function guardUnload(on: boolean): void {
+  if (on === unloadGuarded) return;   // 幂等：状态未变就不重复增删监听
+  unloadGuarded = on;
+  if (on) window.addEventListener('beforeunload', onBeforeUnload);
+  else window.removeEventListener('beforeunload', onBeforeUnload);
+}
+
+/**
+ * 在 fn 执行期间挂上离开守卫，**无论成功、失败还是抛出**都解除。
+ * 刻意只罩住真正开始收字节的那几处调用，而不是整个 run()：探针与元数据阶段
+ * 关掉页面没有任何损失，那时弹「确定要离开吗」是纯粹的骚扰。
+ */
+async function withUnloadGuard<T>(fn: () => Promise<T>): Promise<T> {
+  guardUnload(true);
+  try {
+    return await fn();
+  } finally {
+    guardUnload(false);
+  }
+}
+
 /** 单连接回退：整体下载后用 <a download> 保存。无并行、无断点，仅保可用性。 */
 async function fallbackDownload(url: string, mirrorPrefix: string, filename: string, total: number): Promise<void> {
   ui.log('使用单连接回退模式（无并行加速）…');
@@ -127,14 +159,14 @@ async function run(): Promise<void> {
   // 已经知道答案的事，不要拿去问用户。
   if (!meta.acceptRanges) {
     ui.log('上游不支持 Range，无法并行分块，降级为单连接下载…');
-    await fallbackDownload(raw, best.prefix, meta.filename, meta.total);
+    await withUnloadGuard(() => fallbackDownload(raw, best.prefix, meta.filename, meta.total));
     ui.log('已触发保存。');
     return;
   }
 
   if (!supportsFsa()) {
     ui.showWarning('当前浏览器不支持 File System Access API，将使用单连接回退模式。建议改用 Chrome / Edge。');
-    await fallbackDownload(raw, best.prefix, meta.filename, meta.total);
+    await withUnloadGuard(() => fallbackDownload(raw, best.prefix, meta.filename, meta.total));
     ui.log('已触发保存。');
     return;
   }
@@ -162,7 +194,7 @@ async function run(): Promise<void> {
   let lastBytes = 0;
   let lastT = t0;
 
-  await download({
+  await withUnloadGuard(() => download({
     url: raw,
     total: meta.total,
     mirrors: usable,
@@ -176,7 +208,7 @@ async function run(): Promise<void> {
         lastT = now;
       }
     },
-  });
+  }));
 
   const secs = (Date.now() - t0) / 1000;
   ui.setProgress(meta.total, meta.total);
