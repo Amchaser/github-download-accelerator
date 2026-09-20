@@ -117,4 +117,16 @@ describe('resolveMetadata', () => {
     const f = fakeFetch(206, { 'content-range': 'bytes 0-0/*', 'content-length': '1' });
     await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/无法确定/);
   });
+
+  it('抛错路径同样取消响应体（2xx 但可信大小不可得时，不得让文件在后台继续传）', async () => {
+    // 「2xx 且无可信大小」正是镜像忽略 Range 并 chunked 回传的形态——镜像最不正常、
+    // 探针最该起作用的时刻。此时若不取消，整个文件会继续传输并占住连接。
+    // 这条钉住 cancel 必须位于所有 throw 之前，而不只是返回之前。
+    let cancelled = false;
+    const body = new ReadableStream({ cancel() { cancelled = true; } });
+    const f = (async () =>
+      new Response(body, { status: 200 })) as unknown as typeof fetch; // 无 Content-Length
+    await expect(resolveMetadata(GOOD, 'https://gh.xmly.dev/', f)).rejects.toThrow(/无法确定/);
+    expect(cancelled).toBe(true);
+  });
 });

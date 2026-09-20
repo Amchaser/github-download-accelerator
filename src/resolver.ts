@@ -30,6 +30,16 @@ export async function resolveMetadata(
 ): Promise<AssetMeta> {
   const res = await fetchFn(mirrorPrefix + url, { headers: { Range: 'bytes=0-0' } });
 
+  // 立刻取消响应体，且必须放在**任何 throw 之前**：本函数只需要响应头，而下面有两处
+  // throw（非 2xx、以及 2xx 但大小不可用）。后者尤其要紧——「2xx 且无可用大小」正是
+  // 「镜像忽略 Range 并以 chunked 回传」的形态，若不取消，整个文件会在后台继续传输，
+  // 白占连接与镜像并发配额；而探针按镜像并行运行，可能抽干下载引擎随后要用的连接池。
+  // 放在返回前只覆盖成功路径，漏掉抛错路径，等于在镜像最不正常时放弃防护。
+  // 实测 cancel() 之后响应头仍可读，故不影响下面的解析；cancel() 是丢弃而非缓冲。
+  if (res.body) {
+    try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖已取得的头 */ }
+  }
+
   if (res.status !== 206 && !res.ok) {
     throw new Error(`镜像返回 HTTP ${res.status}`);
   }
@@ -57,14 +67,6 @@ export async function resolveMetadata(
   const filename =
     filenameFromDisposition(res.headers.get('content-disposition')) ??
     decodeURIComponent(url.split('/').pop() ?? 'download.bin');
-
-  // 只需要响应头。若不取消，200 路径（镜像忽略 Range）会让整个文件在后台继续传输，
-  // 白占一个连接与镜像的并发配额 —— 而探针本就按镜像并行运行，可能占满下载引擎随后
-  // 要用的连接池，等于探针毒化了它本要保护的那条路径。206 路径虽只有 1 字节，一并取消。
-  // cancel() 是丢弃而非缓冲，不违反热路径禁令。
-  if (res.body) {
-    try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖上面已取到的元数据 */ }
-  }
 
   return { total, filename, acceptRanges };
 }
