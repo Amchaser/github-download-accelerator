@@ -2447,6 +2447,8 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // 一旦显式指定 exclude，vitest 的默认值就被整体替换，须自己带上 node_modules / dist。
+    // .superpowers 用于排除忽略目录里的临时测试文件（vitest 的 **/*.test.ts 不看 .gitignore）。
     exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
   },
 });
