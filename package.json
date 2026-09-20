@@ -1,14 +1,13 @@
 {
-  "name": "github-release-accelerator",
-  "version": "1.0.0",
+  "name": "github-download-accelerator",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "license": "ISC",
   "devDependencies": {
     "@types/node": "^26.6.2",
     "typescript": "^7.0.2",
