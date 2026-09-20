@@ -169,6 +169,10 @@ describe('download', () => {
       download({
         url: URL_, total, mirrors: MIRRORS, sink, chunkSize: total, fetchFn: f,
         minChunkSize: 256,
+        // 用极小退避：本用例验证的是「拆到下限仍失败会抛错而非死循环」，不是退避策略。
+        // 真实退避（200/400/800/1600ms）下 4 个叶子块 × 3000ms ÷ 2 worker = 6000ms 下限，
+        // 会超过 vitest 默认 5s 单测上限——那是超时失败，不是断言失败。
+        backoffBaseMs: 5,
       }),
     ).rejects.toThrow(/403/);
     expect(sink.aborted).toBe(true);
@@ -215,7 +219,8 @@ describe('download', () => {
     await expect(
       download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
     ).rejects.toThrow();
-    // 2 个镜像 × 每个最多重试 3 次 = 6，允许拆分带来的额外调用但不该失控
+    // 重试上限由 maxAttemptsPerChunk（默认 5）按「块」计，不是按镜像计——
+    // 这里只要求「不失控」即可，不断言具体次数。
     expect(calls).toBeLessThanOrEqual(24);
   });
 

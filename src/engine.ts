@@ -1,9 +1,6 @@
 import { plan, splitChunk } from './planner';
 import type { Chunk, Mirror, Sink } from './types';
 
-/** 单镜像单块的最大重试次数。 */
-export const MAX_SAME_MIRROR_RETRIES = 3;
-
 /** 退避基数（毫秒）。第 n 次重试等待 BASE * 2^n。 */
 export const BACKOFF_BASE_MS = 200;
 
@@ -45,6 +42,8 @@ export interface DownloadOptions {
   reqIdleTimeoutMs?: number;
   /** 单分块墙钟死线，默认 CHUNK_DEADLINE_MS。测试用极小值驱动。 */
   chunkDeadlineMs?: number;
+  /** 退避基数，默认 BACKOFF_BASE_MS。测试用极小值让它不必真等指数退避。 */
+  backoffBaseMs?: number;
 }
 
 /** 队列暂空但仍有块未完成时，worker 的轮询间隔。 */
@@ -173,6 +172,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
     minChunkSize,
     reqIdleTimeoutMs = REQ_IDLE_TIMEOUT_MS,
     chunkDeadlineMs = CHUNK_DEADLINE_MS,
+    backoffBaseMs = BACKOFF_BASE_MS,
   } = opts;
 
   let bytesDone = 0;
@@ -235,7 +235,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
         // 放回队尾让其他健康镜像接手。本 worker 随即退避，而空闲的对等 worker
         // 每 SPIN_MS 轮询一次队列，因此健康镜像总能先抢到该块。
         queue.push(job);
-        await sleep(BACKOFF_BASE_MS * 2 ** (job.attempts - 1));
+        await sleep(backoffBaseMs * 2 ** (job.attempts - 1));
       }
     }
   };
