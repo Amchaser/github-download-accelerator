@@ -92,6 +92,11 @@ async function fetchChunk(
     try {
       res = await fetchFn(mirror.prefix + url, {
         headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+        // 与探针同理：分块也必须真的走网络。命中缓存会让显示速度与镜像排名同时失真，
+        // 并且**掩盖镜像已失效**这一事实（缓存里有数据，网络其实不通）。
+        // 代价是重复下载同一文件不再瞬时——但本工具的意义就是「从网络下载」，
+        // 读数如实反映网络，比省掉一次网络流量更重要。
+        cache: 'no-store',
         signal: ac.signal,
       });
     } catch (e) {

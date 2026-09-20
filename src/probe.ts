@@ -26,6 +26,12 @@ async function probeOne(
   try {
     const res = await fetchFn(mirror.prefix + url, {
       headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
+      // **探针的职责是测网络，不是测缓存。** 缺这一行时，重复探测同一文件会直接命中
+      // 浏览器 HTTP 缓存——实测首字节 1.9ms（局域网量级）、吞吐 83 MiB/s（≈660 Mbps），
+      // 而同一时刻、同一镜像、同样带浏览器 UA 用 curl 只有 388 KB/s：**相差 215 倍，全是虚构**。
+      // 后果不止是读数难看：**排名**的根据是假的，而且一个已经失效的镜像会因缓存显得还活着。
+      // （最终整分支评审点名过这一处并列为 Minor 延后——事实证明它不 Minor。）
+      cache: 'no-store',
       signal: controller.signal,
     });
     const ttfbMs = performance.now() - t0;

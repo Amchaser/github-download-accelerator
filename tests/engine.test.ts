@@ -519,7 +519,30 @@ describe('download', () => {
     expect(Math.max(...seen)).toBe(total);  // 恰好到 total；逐次上报会让它超出
   });
 
-});   // 关闭 describe('download')——两条修复守卫用例已在组内
+  it('分块请求必须带 cache: no-store —— 缓存会同时伪造速度与镜像健康度', async () => {
+    // 与探针同理（见 probe.test.ts 中同名断言）：命中缓存会让显示速度与镜像排名一起失真，
+    // 并且**掩盖「该镜像其实已经不通」**——缓存里有数据，网络未必有。
+    const seen: (RequestCache | undefined)[] = [];
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init?.cache);
+      const range = (init?.headers as Record<string, string>).Range;
+      const m = /bytes=(\d+)-(\d+)/.exec(range)!;
+      const start = Number(m[1]);
+      const end = Number(m[2]);
+      const body = new Uint8Array(end - start + 1);
+      for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/1024` },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(1024);
+    await download({ url: URL_, total: 1024, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((c) => c === 'no-store')).toBe(true);
+  });
+
+});   // 关闭 describe('download')
 
 describe('ChunkError', () => {
   it('携带 retryable 标记', () => {

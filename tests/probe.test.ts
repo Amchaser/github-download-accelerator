@@ -34,6 +34,19 @@ describe('probeMirrors', () => {
     expect(seen).toEqual([`bytes=0-${PROBE_BYTES - 1}`, `bytes=0-${PROBE_BYTES - 1}`]);
   });
 
+  it('必须带 cache: no-store —— 命中 HTTP 缓存会把速度与排名一起变成虚构', async () => {
+    // 缺这一行时的实测现象：首字节 1.9ms（局域网量级）、吞吐 83 MiB/s（≈660 Mbps），
+    // 而同一时刻、同一镜像、同样带浏览器 UA 用 curl 只有 388 KB/s——相差 215 倍，全来自缓存。
+    // 后果不止读数难看：**排名**的依据是假的，而且已失效的镜像会因缓存显得还活着。
+    const seen: (RequestCache | undefined)[] = [];
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init?.cache);
+      return new Response(new Uint8Array(16), { status: 206, headers: {} });
+    }) as unknown as typeof fetch;
+    await probeMirrors(URL_, M, f);
+    expect(seen).toEqual(['no-store', 'no-store']);
+  });
+
   it('非 206 的镜像标记为不可用', async () => {
     const f = (async () => new Response(null, { status: 403 })) as unknown as typeof fetch;
     const r = await probeMirrors(URL_, M, f);
