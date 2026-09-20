@@ -5,5 +5,12 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   root: '.',
   build: { outDir: 'dist' },
-  test: { globals: true, environment: 'node' },
+  test: {
+    globals: true,
+    environment: 'node',
+    // 一旦显式指定 exclude，vitest 的默认值就被整体替换，必须自己带上 node_modules / dist。
+    // 加 .superpowers 是因为 vitest 的默认 include 是 **/*.test.ts，它**不看 .gitignore**——
+    // 放在忽略目录里的临时验证测试文件会被一起收集，静默膨胀套件并让「预期 N passed」核对失效。
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.superpowers/**'],
+  },
 });
