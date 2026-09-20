@@ -816,15 +816,17 @@ describe('plan', () => {
 });
 
 describe('splitChunk', () => {
+  // 凡是要走到「拆分」分支的用例都必须显式传 minChunkSize。默认下限 1 MiB，
+  // 而测试块只有几十字节，`len < minChunkSize * 2` 恒成立，会直接返回 null。
   it('把一块均分为两块', () => {
-    expect(splitChunk({ index: 0, start: 0, end: 9 })).toEqual([
+    expect(splitChunk({ index: 0, start: 0, end: 9 }, 5)).toEqual([
       { index: 0, start: 0, end: 4 },
       { index: 1, start: 5, end: 9 },
     ]);
   });
 
   it('奇数长度时前半段较短', () => {
-    expect(splitChunk({ index: 0, start: 0, end: 8 })).toEqual([
+    expect(splitChunk({ index: 0, start: 0, end: 8 }, 4)).toEqual([
       { index: 0, start: 0, end: 3 },
       { index: 1, start: 4, end: 8 },
     ]);
@@ -843,7 +845,15 @@ describe('splitChunk', () => {
       { index: 0, start: 0, end: 511 },
       { index: 1, start: 512, end: 1023 },
     ]);
-    expect(splitChunk({ index: 0, start: 0, end: 511 }, 256)).toBeNull();
+    // len === minChunkSize * 2 必须仍可拆成两个「恰好等于下限」的块——这是
+    // 「降到下限 1 MB 仍失败才转单连接」的必要条件。若把实现里的 `<` 改成 `<=`，
+    // 下限会实际退化为 2 倍，永远拆不到 1 MB。
+    expect(splitChunk({ index: 0, start: 0, end: 511 }, 256)).toEqual([
+      { index: 0, start: 0, end: 255 },
+      { index: 1, start: 256, end: 511 },
+    ]);
+    // len === minChunkSize * 2 - 1 时才无法对半分成两个 ≥ 下限的块
+    expect(splitChunk({ index: 0, start: 0, end: 510 }, 256)).toBeNull();
   });
 });
 ```
@@ -854,7 +864,9 @@ describe('splitChunk', () => {
 cd "D:/github_download++" && npx vitest run tests/planner.test.ts
 ```
 
-预期：FAIL，报 `Failed to resolve import "../src/planner"`。
+预期：FAIL，报模块无法解析。**措辞随 vitest 版本变**：本仓库装的是 vitest 5，
+报 `Cannot find module '../src/planner'`；vitest 3 及更早报 `Failed to resolve import`。
+根因相同，不要因为措辞不同就以为出了别的问题。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -908,7 +920,7 @@ export function splitChunk(chunk: Chunk, minChunkSize: number = MIN_CHUNK_SIZE):
 cd "D:/github_download++" && npx vitest run tests/planner.test.ts
 ```
 
-预期：11 passed（`plan` 组 6 个 + `splitChunk` 组 5 个）。
+预期：12 passed（`plan` 组 6 个 + `splitChunk` 组 6 个）。
 
 - [ ] **Step 5: 提交**
 
