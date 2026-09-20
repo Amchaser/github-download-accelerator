@@ -1050,6 +1050,19 @@ describe('resolveMetadata', () => {
     await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
     expect(seen).toBe(`https://gh.xmly.dev/${GOOD}`);
   });
+
+  it('用 GET + Range: bytes=0-0 探测，而不是 HEAD（一次往返同时拿大小与 Range 支持）', async () => {
+    // 这条钉住本模块的设计前提：用带 Range 的 GET 一次拿到「总大小」与「是否支持 Range」。
+    // 若有人改成 HEAD，其余用例仍会全绿，而 206/200 分支的前提与「减少往返」的理由会静默失效。
+    let init: RequestInit | undefined;
+    const f = (async (_i: RequestInfo | URL, i?: RequestInit) => {
+      init = i;
+      return new Response(null, { status: 206, headers: { 'content-range': 'bytes 0-0/100' } });
+    }) as unknown as typeof fetch;
+    await resolveMetadata(GOOD, 'https://gh.xmly.dev/', f);
+    expect(init?.method ?? 'GET').toBe('GET');
+    expect((init?.headers as Record<string, string>).Range).toBe('bytes=0-0');
+  });
 });
 ```
 
@@ -1110,17 +1123,29 @@ export async function resolveMetadata(
     const m = cr ? /\/(\d+)\s*$/.exec(cr) : null;
     if (m) total = Number(m[1]);
   }
-  if (total === null) {
+  // Content-Length 兜底只对「非 206」成立。206 响应的 Content-Length 是**分片**长度
+  // （Range: bytes=0-0 时就是 1 字节），拿它当资产总大小会把 500MB 的资产变成
+  // 「1 字节下载成功」，而且能通过下面的 > 0 校验 —— 正是 spec 明令必须判为失败的
+  // 静默损坏形态。所以 206 但 Content-Range 缺失或不可解析时，直接掉到下面 throw。
+  if (total === null && !acceptRanges) {
     const len = res.headers.get('content-length');
     if (len) total = Number(len);
   }
   if (total === null || !Number.isFinite(total) || total <= 0) {
-    throw new Error('无法确定资源大小（响应既无 Content-Range 也无有效 Content-Length）');
+    throw new Error('无法确定资源大小（206 但 Content-Range 缺失或不可解析，或非 206 且无有效 Content-Length）');
   }
 
   const filename =
     filenameFromDisposition(res.headers.get('content-disposition')) ??
     decodeURIComponent(url.split('/').pop() ?? 'download.bin');
+
+  // 只需要响应头。若不取消，200 路径（镜像忽略 Range）会让整个文件在后台继续传输，
+  // 白占一个连接与镜像的并发配额 —— 而探针本就按镜像并行运行，可能占满下载引擎随后
+  // 要用的连接池，等于探针毒化了它本要保护的那条路径。206 路径虽只有 1 字节，一并取消。
+  // cancel() 是丢弃而非缓冲，不违反热路径禁令。
+  if (res.body) {
+    try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖上面已取到的元数据 */ }
+  }
 
   return { total, filename, acceptRanges };
 }
@@ -1132,7 +1157,7 @@ export async function resolveMetadata(
 cd "D:/github_download++" && npx vitest run tests/resolver.test.ts
 ```
 
-预期：11 passed。
+预期：12 passed（`parseReleaseUrl` 组 5 个 + `resolveMetadata` 组 7 个）。
 
 - [ ] **Step 5: 提交**
 
