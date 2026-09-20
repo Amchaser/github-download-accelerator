@@ -16,8 +16,14 @@ async function fallbackDownload(url: string, mirrorPrefix: string, filename: str
   const a = document.createElement('a');
   a.href = href;
   a.download = filename;
+  // 先挂进文档再 click：部分浏览器对游离节点上的程序化 click 不放行。
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(href);
+  a.remove();
+  // **绝不能紧跟 click() 同步 revoke**：部分浏览器要等到稍后才真正开始读取该 URL，
+  // 立刻 revoke 会把下载**直接取消掉**，而这个路径正是 Firefox / Safari 用户唯一的路径。
+  // 给足时间再释放（顺带避免把大 blob 一直攥在内存里）。
+  setTimeout(() => URL.revokeObjectURL(href), 60_000);
 }
 
 async function run(): Promise<void> {

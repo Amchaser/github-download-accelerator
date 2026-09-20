@@ -2685,8 +2685,14 @@ async function fallbackDownload(url: string, mirrorPrefix: string, filename: str
   const a = document.createElement('a');
   a.href = href;
   a.download = filename;
+  // 先挂进文档再 click：部分浏览器对游离节点上的程序化 click 不放行。
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(href);
+  a.remove();
+  // **绝不能紧跟 click() 同步 revoke**：部分浏览器要等到稍后才真正开始读取该 URL，
+  // 立刻 revoke 会把下载**直接取消掉**，而这个路径正是 Firefox / Safari 用户唯一的路径。
+  // 给足时间再释放（顺带避免把大 blob 一直攥在内存里）。
+  setTimeout(() => URL.revokeObjectURL(href), 60_000);
 }
 
 async function run(): Promise<void> {
@@ -2726,6 +2732,10 @@ async function run(): Promise<void> {
   let sink: Sink;
   if (supportsFsa()) {
     sink = await createFsaSink(meta.filename);
+    // FSA 的写入先进临时文件，只有 close() 才把内容换到用户选定的路径上。于是**整个
+    // 下载期间目标文件都是 0 字节**，最后一次性出现——不预先说明的话，人看着一个
+    // 0 字节文件会合理地以为卡住了。
+    ui.log('说明：目标文件在下载过程中会一直显示 0 字节，下载完毕才一次性写入内容（浏览器先写临时文件）。');
   } else {
     ui.showWarning('当前浏览器不支持 File System Access API，将使用单连接回退模式。建议改用 Chrome / Edge。');
     await fallbackDownload(raw, best.prefix, meta.filename);
@@ -2772,6 +2782,13 @@ ui.els.go.addEventListener('click', async () => {
   try {
     await run();
   } catch (e) {
+    // 保存对话框被用户取消时，showSaveFilePicker 以 DOMException(AbortError) 拒绝。
+    // 那是**用户刻意的动作，不是失败**：不该在日志里报「失败：…」、更不该提示
+    // 「下载失败，请查看日志」。此处静默结束本轮，按钮照常复位。
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      ui.log('已取消：未选择保存位置，本次下载未开始。');
+      return;
+    }
     const msg = e instanceof Error ? e.message : String(e);
     ui.log(`失败：${msg}`, true);
     ui.els.hint.textContent = e instanceof UnsupportedBrowserError ? '请改用 Chrome / Edge' : '下载失败，请查看日志';
