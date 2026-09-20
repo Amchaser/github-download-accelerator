@@ -1735,9 +1735,14 @@ describe('download', () => {
         headers: { 'content-range': `bytes 0-1023/${total}` },
       })) as unknown as typeof fetch;
     const sink = new MemSink(total);
+    const seen: number[] = [];
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5,
+        onProgress: (done) => seen.push(done) }),
     ).rejects.toThrow(/字节数不足/);
+    // 上报必须在「字节数校验通过」之后：被截断的块不得计入进度。
+    // 若把 onBytes(written) 挪到校验之前，这里会看到 100 而不是空数组。
+    expect(seen).toEqual([]);
   });
 
   it('单镜像失败后由另一镜像补上', async () => {
@@ -1889,7 +1894,6 @@ describe('download', () => {
     ).rejects.toThrow(/墙钟死线/);
     expect(abortedFlag).toBe(true);
   });
-});
 
   it('单个镜像返回 200 不会拖垮整轮——健康镜像接手后下载成功', async () => {
     // 「单个镜像失效绝不能导致整个下载失败」的直接体现：200 只说明**该镜像**不遵守
@@ -1958,6 +1962,8 @@ describe('download', () => {
     expect(sink.buf).toEqual(expected(total));
     expect(Math.max(...seen)).toBe(total);  // 恰好到 total；逐次上报会让它超出
   });
+
+});   // 关闭 describe('download')——两条修复守卫用例已在组内
 
 describe('ChunkError', () => {
   it('携带 retryable 标记', () => {
@@ -2134,7 +2140,13 @@ async function fetchChunk(
         // 本 worker 内串行 await（同一块内至多一个写入在途），且读完即写即弃——
         // 不累积，故内存与文件大小无关。跨 worker 的并发写是安全的：FSA 内部对写入
         // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
-        await sink.write(pos, r.value);
+        try {
+          await sink.write(pos, r.value);
+        } catch (e) {
+          // 与 fetchChunk 里其它每条错误一样带镜像前缀与字节区间：先前这里直接逃逸，
+          // 被上层包成裸 String(e)、既无归因也看不出是写入问题。
+          throw new ChunkError(`${label} 写入失败（位置 ${pos}）: ${(e as Error).message}`, true);
+        }
         pos += r.value.byteLength;
         written += r.value.byteLength;
       }
@@ -2147,12 +2159,19 @@ async function fetchChunk(
   } finally {
     clearTimeout(idleTimer);
     clearTimeout(deadlineTimer);
-    // 取消响应体。**每一条 throw 路径都会走到这里**（403 / 200 / 非 206 /
-    // Content-Range 不符 / 字节数不足），若不取消，整个文件会在后台继续传输、
-    // 白占连接与镜像并发配额——与 resolver.ts 属同一缺陷类别（Task 4 评审确立）。
-    // 成功路径上 body 已读完关闭，此时 cancel() 是无害的空操作。
+    // 取消响应体：**刻意不 await**。await 一个由注入代码返回的 promise，是本模块
+    // （整个存在意义就是死线纪律）里唯一边界不明的等待——若它永不 settle，worker 的
+    // promise 永不 settle、Promise.all 永不 settle，而两道计时恰在上面刚被清掉，
+    // 于是整轮**静默挂死**。取消是尽力而为的清理，不需要知道结果。
+    //
+    // 覆盖面（实测确认）：在**尚未 getReader() 的路径**上（403 / 200 / 非 206 /
+    // Content-Range 不符 / 无 body）cancel() 会真正释放 body——那正是「整个文件会在
+    // 后台继续传输、白占连接与镜像并发配额」的路径，与 resolver.ts 属同一缺陷类别
+    // （Task 4 评审确立）。而**已 getReader() 之后**（如字节数不足）流已被锁定，
+    // cancel() 会以 ERR_INVALID_STATE 被拒并被吞掉：无害，因为该路径只在 r.done 之后
+    // 可达、流已关闭。不要据此以为已读过 body 的路径也被取消了。
     if (res && res.body) {
-      try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖真正的错误 */ }
+      void res.body.cancel().catch(() => { /* 尽力而为；失败无关紧要，也不掩盖真正的错误 */ });
     }
   }
 }

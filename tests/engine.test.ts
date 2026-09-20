@@ -133,9 +133,14 @@ describe('download', () => {
         headers: { 'content-range': `bytes 0-1023/${total}` },
       })) as unknown as typeof fetch;
     const sink = new MemSink(total);
+    const seen: number[] = [];
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5,
+        onProgress: (done) => seen.push(done) }),
     ).rejects.toThrow(/字节数不足/);
+    // 上报必须在「字节数校验通过」之后：被截断的块不得计入进度。
+    // 若把 onBytes(written) 挪到校验之前，这里会看到 100 而不是空数组。
+    expect(seen).toEqual([]);
   });
 
   it('单镜像失败后由另一镜像补上', async () => {
@@ -287,7 +292,6 @@ describe('download', () => {
     ).rejects.toThrow(/墙钟死线/);
     expect(abortedFlag).toBe(true);
   });
-});
 
   it('单个镜像返回 200 不会拖垮整轮——健康镜像接手后下载成功', async () => {
     // 「单个镜像失效绝不能导致整个下载失败」的直接体现：200 只说明**该镜像**不遵守
@@ -356,6 +360,8 @@ describe('download', () => {
     expect(sink.buf).toEqual(expected(total));
     expect(Math.max(...seen)).toBe(total);  // 恰好到 total；逐次上报会让它超出
   });
+
+});   // 关闭 describe('download')——两条修复守卫用例已在组内
 
 describe('ChunkError', () => {
   it('携带 retryable 标记', () => {
