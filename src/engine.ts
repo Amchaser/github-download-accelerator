@@ -83,8 +83,10 @@ async function fetchChunk(
   };
   const deadlineTimer = setTimeout(() => { if (!fired) fired = '墙钟死线'; ac.abort(); }, chunkDeadlineMs);
 
-  // res 声明在 try 之外，才能在 finally 里取消它的 body。
+  // res / reader 都声明在 try 之外，才能在 finally 里取消（见下方 finally 的注释：
+  // **取过 reader 之后只能经 reader 取消**，res.body 已被锁定）。
   let res: Response | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     armIdle();
     try {
@@ -114,7 +116,14 @@ async function fetchChunk(
       );
     }
     if (res.status !== 206) {
-      throw new ChunkError(`${label} HTTP ${res.status}`, res.status >= 500);
+      // **一律可重试**，不再按状态码分级。任何非 206（404 / 416 / 429 / 5xx …）都只说明
+      // 「该镜像这条路此刻走不通」，换镜像或稍后重试即可，而整轮致命的代价是灾难性的：
+      // 全局 failure 置位 → 所有 worker 停止 → sink.abort() 丢掉**其它 worker 已完成**的
+      // 工作，而 FSA 下没有半成品可救。一个镜像在某一次分块请求上抖一下（约 60 次请求里
+      // 的一次）就毁掉整个下载，正是上面 200 分支所反对、也是本模块存在意义所反对的形态。
+      // 真正永久的情形由尝试预算（maxAttemptsPerChunk）兜住，而**死掉的资产在元数据阶段
+      // 就会失败**（resolveMetadata 连 0 字节都拿不到），根本走不到这里。
+      throw new ChunkError(`${label} HTTP ${res.status}`, true);
     }
 
     const cr = res.headers.get('content-range');
@@ -125,7 +134,8 @@ async function fetchChunk(
 
     if (!res.body) throw new ChunkError(`${label} 响应没有 body`, true);
 
-    const reader = res.body.getReader();
+    const rd = res.body.getReader();
+    reader = rd;   // 供 finally 取消：body 一旦被 getReader() 锁定，res.body.cancel() 会被拒
     let pos = chunk.start;
     // 本块已写入的字节数：**只在整块成功后一次性上报**。逐次上报会让「失败后重下」
     // 的块把字节重复计入进度，出现进度 > 100% 与荒谬的 ETA——而那恰好发生在本模块
@@ -135,7 +145,7 @@ async function fetchChunk(
       armIdle();
       let r;
       try {
-        r = await reader.read();
+        r = await rd.read();
       } catch (e) {
         if (fired) {
           throw new ChunkError(`${label} ${fired}（已读到 ${pos}）：疑似该镜像滴水式限速或卡住，换镜像重试`, true);
@@ -146,6 +156,19 @@ async function fetchChunk(
       // 写入期间停掉空闲计时：一次慢写入不该被误标成「镜像流超时」，它由墙钟死线兜住。
       clearTimeout(idleTimer);
       if (r.value && r.value.byteLength > 0) {
+        // **写入前的上界检查**：正确性不能只押在 Content-Range 头上。一个声明
+        // `bytes 0-1023/…` 却多吐字节的镜像，多出的字节会越过本块区间写进**邻居块**的
+        // 区域；邻居若已由别的镜像完成，就再也不会被重写。而下面的字节数校验会抛错、
+        // 本块会重下并成功——于是产出「长度完全正确、内容错误」的文件并报成功，
+        // 正是本项目最危险的那类失败（FSA 没有半成品可救，用户拿到的是一个坏文件）。
+        // 放在写入**之前**，故越界字节一个都不会落盘。
+        // 合规服务端不会被误伤：最后一次读取时 pos + byteLength 恰为 chunk.end + 1。
+        if (pos + r.value.byteLength > chunk.end + 1) {
+          throw new ChunkError(
+            `${label} 响应超出请求区间（位置 ${pos} 起 ${r.value.byteLength} 字节，区间止于 ${chunk.end}）`,
+            true,
+          );
+        }
         // 本 worker 内串行 await（同一块内至多一个写入在途），且读完即写即弃——
         // 不累积，故内存与文件大小无关。跨 worker 的并发写是安全的：FSA 内部对写入
         // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
@@ -173,13 +196,19 @@ async function fetchChunk(
     // promise 永不 settle、Promise.all 永不 settle，而两道计时恰在上面刚被清掉，
     // 于是整轮**静默挂死**。取消是尽力而为的清理，不需要知道结果。
     //
-    // 覆盖面（实测确认）：在**尚未 getReader() 的路径**上（403 / 200 / 非 206 /
-    // Content-Range 不符 / 无 body）cancel() 会真正释放 body——那正是「整个文件会在
+    // 覆盖面（实测确认，Node 下）：**尚未 getReader() 的路径**（403 / 200 / 非 206 /
+    // Content-Range 不符 / 无 body）用 `res.body.cancel()` 释放——那正是「整个文件会在
     // 后台继续传输、白占连接与镜像并发配额」的路径，与 resolver.ts 属同一缺陷类别
-    // （Task 4 评审确立）。而**已 getReader() 之后**（如字节数不足）流已被锁定，
-    // cancel() 会以 ERR_INVALID_STATE 被拒并被吞掉：无害，因为该路径只在 r.done 之后
-    // 可达、流已关闭。不要据此以为已读过 body 的路径也被取消了。
-    if (res && res.body) {
+    // （Task 4 评审确立）。**取过 reader 之后**则必须走 `reader.cancel()`：body 已被锁定，
+    // `res.body.cancel()` 会以 `TypeError: Invalid state: ReadableStream is locked`
+    // **被拒**（不是 ERR_INVALID_STATE 的无害空转，是真的什么都没取消），而
+    // `reader.cancel()` 在锁定状态下正常结算。这一条覆盖的恰恰是**连接仍然活着**的两条
+    // 路径——写入失败（磁盘满 / 配额）与流中途读错：不取消的话，被放弃的 8 MiB 响应会
+    // 继续在后台排空，最多 4 worker × 5 次重试 = 20 条僵尸连接与重试抢带宽。
+    // 已正常读完（r.done）时 reader.cancel() 是无害的空操作。
+    if (reader) {
+      void reader.cancel().catch(() => { /* 尽力而为；失败无关紧要，也不掩盖真正的错误 */ });
+    } else if (res?.body) {
       void res.body.cancel().catch(() => { /* 尽力而为；失败无关紧要，也不掩盖真正的错误 */ });
     }
   }
@@ -239,9 +268,11 @@ export async function download(opts: DownloadOptions): Promise<void> {
       } catch (e) {
         const err = e instanceof ChunkError ? e : new ChunkError(String(e), true);
 
-        // 不可重试的错误（例如 4xx 的非 206 状态）→ 全局放弃，重试不会改变结果。
-        // 注意 200 已改为**可重试**：它只说明该镜像不遵守 Range，换镜像即可，
-        // 不该让一个坏镜像杀死整轮下载。
+        // 不可重试的错误 → 全局放弃，重试不会改变结果。
+        // 现状：**没有任何错误被归为不可重试**——200 与所有非 206 状态（4xx/5xx）都已改为
+        // 可重试，因为它们只说明「该镜像不遵守 Range / 这条路此刻不通」，换镜像即可。
+        // 永久失败由下面的尝试预算兜住；真正死掉的资产在元数据阶段就已经失败了。
+        // 分支保留：将来若出现「重试必然得到同样结果」的错误类别，这里是唯一的全局熔断点。
         if (!err.retryable) {
           if (!failure) failure = err;   // 保留首个错误：后来的可能信息更少
           return;

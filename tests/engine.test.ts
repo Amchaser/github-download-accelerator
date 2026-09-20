@@ -29,8 +29,30 @@ class MemSink implements Sink {
   }
 }
 
+/**
+ * 越界写入的哨兵字节。正常内容只取 0..250（`位置 mod 251`），绝不会是 0xFF，
+ * 于是「越界字节是否落盘」可以被**确定性**观测，不依赖各块的完成顺序。
+ */
+const POISON = 0xff;
+
+/** 在 MemSink 之上标记「是否写入过哨兵字节」。 */
+class PoisonCheckedSink extends MemSink {
+  poisonSeen = false;
+  override async write(position: number, data: Uint8Array): Promise<void> {
+    if (data.includes(POISON)) this.poisonSeen = true;
+    await super.write(position, data);
+  }
+}
+
 /** 造一个按 Range 返回确定性字节的服务端（字节值 = 位置 mod 251）。 */
-function rangeServer(total: number, opts: { failOn?: (start: number, end: number, mirrorPrefix: string) => number | null } = {}) {
+function rangeServer(total: number, opts: {
+  failOn?: (start: number, end: number, mirrorPrefix: string) => number | null;
+  /**
+   * 让该区间**多吐**字节数：Content-Range 与请求区间照旧，body 却更长——镜像撒谎。
+   * 多吐的字节填 POISON，用于确定性地区分「越界写入」与正常内容。
+   */
+  overlongBy?: (start: number, end: number, mirrorPrefix: string) => number | null;
+} = {}) {
   const calls: { prefix: string; start: number; end: number }[] = [];
   const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -46,8 +68,11 @@ function rangeServer(total: number, opts: { failOn?: (start: number, end: number
     if (forced) return new Response(null, { status: forced });
     if (end >= total) return new Response(null, { status: 416 });
 
-    const body = new Uint8Array(end - start + 1);
-    for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+    const len = end - start + 1;
+    const extra = opts.overlongBy?.(start, end, prefix) ?? 0;
+    const body = new Uint8Array(len + extra);
+    for (let i = 0; i < len; i++) body[i] = (start + i) % 251;
+    if (extra > 0) body.fill(POISON, len);
     return new Response(body, {
       status: 206,
       headers: { 'content-range': `bytes ${start}-${end}/${total}` },
@@ -319,6 +344,114 @@ describe('download', () => {
     await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
     expect(calls.some((u) => u.startsWith(bad))).toBe(true); // 坏镜像确实被试过
     expect(sink.buf).toEqual(expected(total));               // 健康镜像补齐了全部字节
+  });
+
+  it('单个镜像返回 404 不会拖垮整轮——健康镜像接手后下载成功', async () => {
+    // 与上面的 200 用例同源：任何非 206（404 / 416 / 429 / 5xx）都只说明「该镜像这条路
+    // 此刻不通」，换镜像或重试即可。先前 4xx（除 403）被当作**整轮致命**：全局 failure
+    // 置位 → 所有 worker 停止 → sink.abort() 丢掉其它 worker 已完成的工作，而 FSA 下
+    // 没有半成品可救。约 60 次分块请求里只要有一次撞上，整个下载就毁了。
+    // 保留真实退避：镜像交接就发生在失败方的退避窗口内（本用例机制的一部分）。
+    const total = 2048;
+    const bad = MIRRORS[0].prefix;
+    const { f, calls } = rangeServer(total, {
+      failOn: (_s, _e, prefix) => (prefix === bad ? 404 : null),
+    });
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(calls.some((c) => c.prefix === bad)).toBe(true); // 坏镜像确实被试过
+    expect(sink.buf).toEqual(expected(total));              // 健康镜像补齐了全部字节
+    expect(sink.closed).toBe(true);
+  });
+
+  it('单个镜像返回 429 时同一块按预算重试，而不是整轮立即失败', async () => {
+    // 单镜像 + 单块，直接盯住「4xx 是否可重试」本身：第一次 429、第二次成功。
+    // 修复前 429 被归为不可重试 → 全局 failure → 整轮失败（且 abort sink）。
+    const total = 1024;
+    let attempts = 0;
+    const { f } = rangeServer(total, { failOn: () => (++attempts === 1 ? 429 : null) });
+    const sink = new MemSink(total);
+    await download({
+      url: URL_, total, mirrors: [MIRRORS[0]], sink, chunkSize: 1024, fetchFn: f,
+      backoffBaseMs: 5,
+    });
+    expect(attempts).toBe(2);
+    expect(sink.buf).toEqual(expected(total));
+    expect(sink.aborted).toBe(false);
+  });
+
+  it('镜像多吐字节时判为失败，越界字节一个都不写入（不污染相邻区块）', async () => {
+    // 镜像声称 `bytes 0-1023/2048`，实际吐 1536 字节。若不校验上界，多出的 512 字节会被
+    // 写到**邻居块**的区间上；邻居若已由别的镜像完成，就再也不会被重写——而字节数校验
+    // 会抛错、本块会重下并成功，于是产出「长度完全正确、内容错误」的文件并报成功。
+    // 哨兵值使「是否越界写入」与块完成顺序无关：修复前 poisonSeen 必为 true。
+    const total = 2048;
+    const { f } = rangeServer(total, { overlongBy: (s) => (s === 0 ? 512 : 0) });
+    const sink = new PoisonCheckedSink(total);
+    await expect(
+      download({
+        url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+        backoffBaseMs: 5, maxAttemptsPerChunk: 1,
+      }),
+    ).rejects.toThrow(/超出请求区间/);
+    expect(sink.poisonSeen).toBe(false);
+    expect(sink.aborted).toBe(true);
+  });
+
+  it('多吐字节的块被拒绝并重下，最终长度与内容都正确（相邻区块未被污染）', async () => {
+    // 同一缺陷的成功侧：超量只发生在该块第一次，重下时守规矩——于是最终文件必须
+    // 逐字节正确，且越界字节从未写进文件（哪怕它们随后会被邻居覆盖掉也算污染源）。
+    const total = 2048;
+    let firstChunkCalls = 0;
+    const { f } = rangeServer(total, {
+      overlongBy: (s) => {
+        if (s !== 0) return 0;
+        firstChunkCalls++;
+        return firstChunkCalls === 1 ? 512 : 0;
+      },
+    });
+    const sink = new PoisonCheckedSink(total);
+    await download({
+      url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+      backoffBaseMs: 5,
+    });
+    expect(firstChunkCalls).toBeGreaterThanOrEqual(2); // 该块确实被判失败并重下
+    expect(sink.poisonSeen).toBe(false);               // 越界字节从未落盘
+    expect(sink.buf).toEqual(expected(total));         // 含邻居区间 1024..2047 逐字节正确
+    expect(sink.closed).toBe(true);
+  });
+
+  it('写入失败时取消响应体——连接仍活着，必须真正取消而不是留一条僵尸响应', async () => {
+    // 写入失败（磁盘满 / 配额）是**连接仍然活着**的路径之一。此前清理只调 res.body.cancel()：
+    // body 已被 getReader() 锁定，该调用会以 TypeError「ReadableStream is locked」被拒，
+    // 什么都没取消——被放弃的 8 MiB 响应继续在后台排空，与重试抢带宽。
+    // 本用例用一个「有数据后既不关闭也不报错」的流来代表这种连接：只有真正取消才会
+    // 触发 underlying source 的 cancel()。修复前 cancelled 恒为 false。
+    const total = 1024;
+    let cancelled = false;
+    const f = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(new Uint8Array(64)); },   // 之后既不 enqueue 也不 close
+        cancel() { cancelled = true; },
+      });
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes 0-${total - 1}/${total}` },
+      });
+    }) as unknown as typeof fetch;
+    const sink: Sink = {
+      async write() { throw new Error('磁盘已满'); },
+      async close() {},
+      async abort() {},
+    };
+    await expect(
+      download({
+        url: URL_, total, mirrors: [MIRRORS[0]], sink, chunkSize: total, fetchFn: f,
+        backoffBaseMs: 5, maxAttemptsPerChunk: 1, reqIdleTimeoutMs: 50,
+      }),
+    ).rejects.toThrow(/写入失败/);
+    await new Promise((r) => setTimeout(r, 0));   // 取消在 finally 里是「刻意不 await」的，给它一个微任务
+    expect(cancelled).toBe(true);
   });
 
   it('块写了一部分后失败并重下时，进度不重复计数、不超过 total', async () => {
