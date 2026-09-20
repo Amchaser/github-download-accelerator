@@ -763,7 +763,9 @@ cd "D:/github_download++" && git add -A && git commit -m "chore: Vite + TypeScri
 
 **Interfaces:**
 - Consumes: `src/types.ts` 的 `Chunk`
-- Produces: `DEFAULT_CHUNK_SIZE: number`（`8388608`）、`MIN_CHUNK_SIZE: number`（`1048576`）、`plan(total: number, chunkSize?: number): Chunk[]`、`splitChunk(chunk: Chunk): [Chunk, Chunk] | null`
+- Produces: `DEFAULT_CHUNK_SIZE: number`（`8388608`）、`MIN_CHUNK_SIZE: number`（`1048576`）、`plan(total: number, chunkSize?: number): Chunk[]`、`splitChunk(chunk: Chunk, minChunkSize?: number): [Chunk, Chunk] | null`
+  （`minChunkSize` 可覆盖是必需的，不是可选美化：默认下限 1 MiB 时，`len < minChunkSize * 2`
+  对 2 KB 的测试块恒成立，`splitChunk` 永远返回 `null`，拆分分支根本走不到。）
 
 - [ ] **Step 1: 写失败的测试**
 
