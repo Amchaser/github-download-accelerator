@@ -66,7 +66,7 @@ describe('splitChunk', () => {
     expect(splitChunk({ index: 0, start: 0, end: MIN_CHUNK_SIZE - 1 })).toBeNull();
   });
 
-  it('可用 minChunkSize 覆盖默认下限（测试与小文件场景需要）', () => {
+  it('minChunkSize 可覆盖默认下限，并钉住拆分下界 len === 2*minChunkSize', () => {
     expect(splitChunk({ index: 0, start: 0, end: 1023 }, 256)).toEqual([
       { index: 0, start: 0, end: 511 },
       { index: 1, start: 512, end: 1023 },
