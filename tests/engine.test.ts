@@ -99,12 +99,14 @@ describe('download', () => {
     expect(new Set(calls.map((c) => c.prefix)).size).toBeGreaterThan(1);
   });
 
-  it('收到 200（上游忽略 Range）时立即失败，不写入损坏数据', async () => {
+  it('收到 200（上游忽略 Range）时判为失败，且一个字节都不写入', async () => {
     const total = 1024;
     const f = (async () => new Response(new Uint8Array(1024), { status: 200 })) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      // 200 是**可重试**的（换镜像即可），故会重试到尝试预算耗尽才失败。
+      // 用极小退避：本用例验证的是「一个字节都不写」，不是退避策略。
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow(/200/);
     expect(sink.aborted).toBe(true);
     expect(sink.buf).toEqual(new Uint8Array(total));
@@ -286,6 +288,74 @@ describe('download', () => {
     expect(abortedFlag).toBe(true);
   });
 });
+
+  it('单个镜像返回 200 不会拖垮整轮——健康镜像接手后下载成功', async () => {
+    // 「单个镜像失效绝不能导致整个下载失败」的直接体现：200 只说明**该镜像**不遵守
+    // Range，故必须可重试。先前它被当作整轮致命，一个坏镜像足以杀死其余健康镜像
+    // 本可完成的下载。
+    // 注意**保留真实退避**：镜像交接就发生在退避窗口内（失败方退避 200ms，空闲对等方
+    // 每 10ms 轮询队列，故对等方抢得到）；注入极小退避会让失败方自己抢回去。
+    const total = 2048;
+    const bad = MIRRORS[0].prefix;
+    const calls: string[] = [];
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.startsWith(bad)) return new Response(new Uint8Array(total), { status: 200 });
+      const m = /bytes=(\d+)-(\d+)/.exec((init?.headers as Record<string, string>).Range)!;
+      const start = Number(m[1]), end = Number(m[2]);
+      const body = new Uint8Array(end - start + 1);
+      for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(calls.some((u) => u.startsWith(bad))).toBe(true); // 坏镜像确实被试过
+    expect(sink.buf).toEqual(expected(total));               // 健康镜像补齐了全部字节
+  });
+
+  it('块写了一部分后失败并重下时，进度不重复计数、不超过 total', async () => {
+    // 关键在于让失败的那次**已经写入了一些字节**：若逐次上报，重下会把这段字节
+    // 重复计入进度，出现进度 > 100% 与荒谬的 ETA——而那正是本模块存在的意义所在
+    // （重试与降级）的场景。只统计成功的块才不会重复。
+    const total = 2048;
+    let first = true;
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      const m = /bytes=(\d+)-(\d+)/.exec((init?.headers as Record<string, string>).Range)!;
+      const start = Number(m[1]), end = Number(m[2]);
+      if (first) {
+        first = false;
+        let sent = false;
+        const body = new ReadableStream({
+          pull(c) {
+            if (!sent) { sent = true; c.enqueue(new Uint8Array(64)); }
+            else { c.error(new Error('boom')); }   // 写进去 64 字节后再中断
+          },
+        });
+        return new Response(body, {
+          status: 206,
+          headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+        });
+      }
+      const body = new Uint8Array(end - start + 1);
+      for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    const seen: number[] = [];
+    await download({
+      url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+      onProgress: (done) => seen.push(done),
+    });
+    expect(sink.buf).toEqual(expected(total));
+    expect(Math.max(...seen)).toBe(total);  // 恰好到 total；逐次上报会让它超出
+  });
 
 describe('ChunkError', () => {
   it('携带 retryable 标记', () => {

@@ -1701,12 +1701,14 @@ describe('download', () => {
     expect(new Set(calls.map((c) => c.prefix)).size).toBeGreaterThan(1);
   });
 
-  it('收到 200（上游忽略 Range）时立即失败，不写入损坏数据', async () => {
+  it('收到 200（上游忽略 Range）时判为失败，且一个字节都不写入', async () => {
     const total = 1024;
     const f = (async () => new Response(new Uint8Array(1024), { status: 200 })) as unknown as typeof fetch;
     const sink = new MemSink(total);
     await expect(
-      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f }),
+      // 200 是**可重试**的（换镜像即可），故会重试到尝试预算耗尽才失败。
+      // 用极小退避：本用例验证的是「一个字节都不写」，不是退避策略。
+      download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f, backoffBaseMs: 5 }),
     ).rejects.toThrow(/200/);
     expect(sink.aborted).toBe(true);
     expect(sink.buf).toEqual(new Uint8Array(total));
@@ -1889,6 +1891,74 @@ describe('download', () => {
   });
 });
 
+  it('单个镜像返回 200 不会拖垮整轮——健康镜像接手后下载成功', async () => {
+    // 「单个镜像失效绝不能导致整个下载失败」的直接体现：200 只说明**该镜像**不遵守
+    // Range，故必须可重试。先前它被当作整轮致命，一个坏镜像足以杀死其余健康镜像
+    // 本可完成的下载。
+    // 注意**保留真实退避**：镜像交接就发生在退避窗口内（失败方退避 200ms，空闲对等方
+    // 每 10ms 轮询队列，故对等方抢得到）；注入极小退避会让失败方自己抢回去。
+    const total = 2048;
+    const bad = MIRRORS[0].prefix;
+    const calls: string[] = [];
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.startsWith(bad)) return new Response(new Uint8Array(total), { status: 200 });
+      const m = /bytes=(\d+)-(\d+)/.exec((init?.headers as Record<string, string>).Range)!;
+      const start = Number(m[1]), end = Number(m[2]);
+      const body = new Uint8Array(end - start + 1);
+      for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    await download({ url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f });
+    expect(calls.some((u) => u.startsWith(bad))).toBe(true); // 坏镜像确实被试过
+    expect(sink.buf).toEqual(expected(total));               // 健康镜像补齐了全部字节
+  });
+
+  it('块写了一部分后失败并重下时，进度不重复计数、不超过 total', async () => {
+    // 关键在于让失败的那次**已经写入了一些字节**：若逐次上报，重下会把这段字节
+    // 重复计入进度，出现进度 > 100% 与荒谬的 ETA——而那正是本模块存在的意义所在
+    // （重试与降级）的场景。只统计成功的块才不会重复。
+    const total = 2048;
+    let first = true;
+    const f = (async (_i: RequestInfo | URL, init?: RequestInit) => {
+      const m = /bytes=(\d+)-(\d+)/.exec((init?.headers as Record<string, string>).Range)!;
+      const start = Number(m[1]), end = Number(m[2]);
+      if (first) {
+        first = false;
+        let sent = false;
+        const body = new ReadableStream({
+          pull(c) {
+            if (!sent) { sent = true; c.enqueue(new Uint8Array(64)); }
+            else { c.error(new Error('boom')); }   // 写进去 64 字节后再中断
+          },
+        });
+        return new Response(body, {
+          status: 206,
+          headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+        });
+      }
+      const body = new Uint8Array(end - start + 1);
+      for (let i = 0; i < body.length; i++) body[i] = (start + i) % 251;
+      return new Response(body, {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${total}` },
+      });
+    }) as unknown as typeof fetch;
+    const sink = new MemSink(total);
+    const seen: number[] = [];
+    await download({
+      url: URL_, total, mirrors: MIRRORS, sink, chunkSize: 1024, fetchFn: f,
+      onProgress: (done) => seen.push(done),
+    });
+    expect(sink.buf).toEqual(expected(total));
+    expect(Math.max(...seen)).toBe(total);  // 恰好到 total；逐次上报会让它超出
+  });
+
 describe('ChunkError', () => {
   it('携带 retryable 标记', () => {
     expect(new ChunkError('x', true).retryable).toBe(true);
@@ -1998,9 +2068,10 @@ async function fetchChunk(
   };
   const deadlineTimer = setTimeout(() => { if (!fired) fired = '墙钟死线'; ac.abort(); }, chunkDeadlineMs);
 
+  // res 声明在 try 之外，才能在 finally 里取消它的 body。
+  let res: Response | undefined;
   try {
     armIdle();
-    let res: Response;
     try {
       res = await fetchFn(mirror.prefix + url, {
         headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
@@ -2017,9 +2088,14 @@ async function fetchChunk(
       throw new ChunkError(`${label} HTTP 403（疑似大 Range 被拒）`, true);
     }
     if (res.status === 200) {
+      // retryable 为 **true**：200 只说明「该镜像不遵守 Range」，是镜像自身的问题，
+      // 换一个镜像重试即可；若所有镜像都回 200，尝试预算会驱动同样的硬失败。
+      // 设为 false 会让一个坏镜像杀死其余健康镜像本可完成的下载，违背
+      // 「单个镜像失效绝不能导致整个下载失败」这条关键约束。
+      // 安全性不受影响：本分支在写入任何字节之前就抛错。
       throw new ChunkError(
         `${label} HTTP 200：上游忽略了 Range 请求，无法分块下载`,
-        false,
+        true,
       );
     }
     if (res.status !== 206) {
@@ -2036,6 +2112,10 @@ async function fetchChunk(
 
     const reader = res.body.getReader();
     let pos = chunk.start;
+    // 本块已写入的字节数：**只在整块成功后一次性上报**。逐次上报会让「失败后重下」
+    // 的块把字节重复计入进度，出现进度 > 100% 与荒谬的 ETA——而那恰好发生在本模块
+    // 存在的意义所在（重试与降级）的场景里。
+    let written = 0;
     for (;;) {
       armIdle();
       let r;
@@ -2056,16 +2136,24 @@ async function fetchChunk(
         // 排队串行化，且显式 position 使写入顺序无关（见 Global Constraints）。
         await sink.write(pos, r.value);
         pos += r.value.byteLength;
-        onBytes(r.value.byteLength);
+        written += r.value.byteLength;
       }
     }
 
     if (pos !== chunk.end + 1) {
       throw new ChunkError(`${label} 字节数不足：期望 ${chunk.end + 1 - chunk.start} 字节，实收 ${pos - chunk.start} 字节`, true);
     }
+    onBytes(written);   // 走到这里说明整块已校验通过，此时才计入进度
   } finally {
     clearTimeout(idleTimer);
     clearTimeout(deadlineTimer);
+    // 取消响应体。**每一条 throw 路径都会走到这里**（403 / 200 / 非 206 /
+    // Content-Range 不符 / 字节数不足），若不取消，整个文件会在后台继续传输、
+    // 白占连接与镜像并发配额——与 resolver.ts 属同一缺陷类别（Task 4 评审确立）。
+    // 成功路径上 body 已读完关闭，此时 cancel() 是无害的空操作。
+    if (res && res.body) {
+      try { await res.body.cancel(); } catch (e) { /* 取消失败无关紧要，不掩盖真正的错误 */ }
+    }
   }
 }
 
@@ -2123,10 +2211,11 @@ export async function download(opts: DownloadOptions): Promise<void> {
       } catch (e) {
         const err = e instanceof ChunkError ? e : new ChunkError(String(e), true);
 
-        // 不可重试（如上游忽略 Range 返回 200）→ 全局放弃。
-        // 此时继续写会产出损坏文件，绝不能容忍。
+        // 不可重试的错误（例如 4xx 的非 206 状态）→ 全局放弃，重试不会改变结果。
+        // 注意 200 已改为**可重试**：它只说明该镜像不遵守 Range，换镜像即可，
+        // 不该让一个坏镜像杀死整轮下载。
         if (!err.retryable) {
-          failure = err;
+          if (!failure) failure = err;   // 保留首个错误：后来的可能信息更少
           return;
         }
 
@@ -2143,7 +2232,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
         }
 
         if (job.attempts >= maxAttemptsPerChunk) {
-          failure = err;
+          if (!failure) failure = err;   // 保留首个错误：后来的可能信息更少
           return;
         }
 
@@ -2173,7 +2262,7 @@ export async function download(opts: DownloadOptions): Promise<void> {
 cd "D:/github_download++" && npx vitest run tests/engine.test.ts
 ```
 
-预期：18 passed（原 16 条 + 两条超时归因用例：空闲超时、墙钟死线）。
+预期：20 passed（原 16 条 + 两条超时归因用例：空闲超时、墙钟死线 + 两条修复守卫：单镜像 200 不拖垮整轮、重下不重复计进度）。
 
 - [ ] **Step 5: 提交**
 
