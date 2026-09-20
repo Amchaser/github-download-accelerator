@@ -63,6 +63,34 @@ const HAS_MEM = typeof performance !== 'undefined' && !!performance.memory;
 // 无 performance.memory 时一律打印 N/A。打印 0MiB 会被读成「内存极好」——那是假 PASS。
 const fmtHeap = (bytes) => HAS_MEM ? `${(bytes / 1048576).toFixed(0)}MiB` : 'N/A';
 
+// 归因只看失败消息的文本，不看阶段前缀：[下载] 里同时装着「写入 / 区块完整性」与
+// 「纯镜像请求失败」两类，按前缀判断会把一次镜像退化误判成架构不成立。
+// 注意顺序：[探针] 分支必须最先判——探针的 Content-Range 失配消息里也带着 "Content-Range"，
+// 否则会被下面的写入类正则捞走，把「镜像不遵守 Range」误导成「并发写有问题」。
+const PROBE_FAIL_RE = /\[探针\]/;
+const FINALIZE_FAIL_RE = /\[收尾\]/;
+const WRITE_FAIL_RE = /写入失败|期望 206|Content-Range|截断/;
+const MIRROR_FAIL_RE = /请求失败\/超时|流中断\/超时/;
+function logFailureAttribution(msg) {
+  const m = String(msg == null ? '' : msg);
+  if (PROBE_FAIL_RE.test(m)) {
+    log('[并发归因] 失败在探针阶段 —— 这是镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西。');
+    log('[并发归因] 换一个可用镜像重跑；不要用 WORKERS=1 归因（它换的是并发度，换不掉一个坏镜像）。');
+  } else if (FINALIZE_FAIL_RE.test(m)) {
+    log('[并发归因] 失败发生在收尾（close / 读取落盘文件大小），不是镜像问题；常见原因是磁盘空间不足或落盘失败。');
+    log('[并发归因] 先确认目标盘剩余空间后原样重跑；不要用 WORKERS=1 归因——它改的是并发，与收尾无关。');
+  } else if (WRITE_FAIL_RE.test(m)) {
+    log(`[并发归因] 失败消息指向写入 / 区块完整性 ⇒ 把脚本顶部的 WORKERS 改成 1 后原样重跑（其余步骤不变）：`);
+    log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
+    log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+  } else if (MIRROR_FAIL_RE.test(m)) {
+    log('[并发归因] 失败消息指向某个镜像的请求 / 流问题，与写入无关 ⇒ 该镜像可疑，请换用另一个镜像重跑。');
+    log('[并发归因] 此时不要改成 WORKERS=1：WORKERS=1 只用 MIRRORS[0]，会静默丢掉故障镜像而「成功」，把镜像退化误读成并发问题。');
+  } else {
+    log('[并发归因] 失败消息既不像写入问题、也不像镜像请求问题 ⇒ 不得用 WORKERS=1 捷径下结论，先单独复现并记下完整消息。');
+  }
+}
+
 document.getElementById('go').onclick = async () => {
   // 先在运行最开始、无条件地交代度量口径与归因方法，
   // 这样无论后面是成功还是失败，读日志的人都知道该怎么读这些数字。
@@ -72,11 +100,13 @@ document.getElementById('go').onclick = async () => {
   log('[MEMORY] 下面的 heap/peak 只是渲染进程 V8 JS 堆的读数：TypedArray/ArrayBuffer 后备存储至多被部分计入，');
   log('[MEMORY] 而 FSA 写入管线与网络缓冲都活在浏览器进程里，performance.memory 完全看不到它们。');
   log('[MEMORY] 因此这个数字无法排除「整个浏览器进程的内存随文件大小增长」。');
+  log('[MEMORY] 另外这些读数本身还是粗粒度的：未以 --enable-precise-memory-info 启动时 Chrome 会对该值分桶量化，只可当数量级看。');
   log('[MEMORY] 人工必须另开 Chrome 任务管理器（Shift+Esc），在下载前 / 下载中 / 下载后各记录一次本标签页内存，三项都写进结论。');
   if (!HAS_MEM) log('[MEMORY] 本环境没有 performance.memory：本次 heap=N/A peak=N/A —— 这是「测不到」，不是「内存优秀」。须用 Chrome/Edge 重跑。');
-  log(`[并发归因] 若本次以 WORKERS=${WORKERS} 失败，请把脚本顶部的 WORKERS 改成 1 后重跑（其余步骤不变）：`);
-  log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
-  log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+  // 并发归因只在失败时、且按失败消息的文本给出（见 logFailureAttribution）。
+  // 在这里先交代判读口径，避免事后读日志的人不知道该怎么归因。
+  log('[并发归因] 若失败，归因只看失败消息的文本，不看阶段前缀：[探针] ⇒ 镜像 / 网络问题，本轮无效；[收尾] ⇒ close / 落盘问题；');
+  log('[并发归因] 含「写入失败 / 期望 206 / Content-Range / 截断」⇒ 区块完整性或写入问题（可做 WORKERS=1 归因）；含「请求失败/超时 / 流中断/超时」⇒ 该镜像的请求 / 流问题，换一个镜像重跑，不要用 WORKERS=1 捷径。');
 
   // 特性预检：非 Chromium / 非安全上下文时应报「环境不支持」，
   // 而不是抛 TypeError 之后再补一句 SecurityError 的提示，把不支持的环境带进重试死循环。
@@ -85,11 +115,19 @@ document.getElementById('go').onclick = async () => {
     log('本 spike 需要 Chromium 内核浏览器（Chrome / Edge），且页面必须经 http://localhost 提供；file:// 不是可靠的安全上下文，Firefox / Safari 也不支持该 API。');
     return;
   }
+  // 能力检测必须检测 createWritable，而不是只看 showSaveFilePicker：
+  // 有选择器、但没有 createWritable 的环境会在下面「若为 SecurityError …
+  // 重新点一次即可」那句提示里被带进重试死循环——真正缺失的能力与用户激活无关。
+  if (typeof FileSystemFileHandle === 'undefined' || typeof FileSystemFileHandle.prototype.createWritable !== 'function') {
+    log('无法创建文件: 本环境有 window.showSaveFilePicker，但 FileSystemFileHandle.prototype.createWritable 不可用。');
+    log('本 spike 的定位写入依赖 createWritable() 返回的 FileSystemWritableFileStream；只有保存选择器不构成所需能力，重试点击不会改变结果。');
+    return;
+  }
 
   // showSaveFilePicker 依赖用户手势的瞬时激活（Chrome 约 5 秒），
   // 因此它必须排在所有 await 之前。若先等镜像探测再调用，激活会过期并抛
   // SecurityError，表现为「点了没反应」——极易被误判成 FSA 不可行。
-  // 这是本 spike 唯一的假阴性来源。
+  // 这是本 spike 最容易踩的假阴性来源。
   let handle;
   let stream;
   let heapTimer;            // 声明在 try 之外，catch 里才能 clearInterval
@@ -155,7 +193,7 @@ document.getElementById('go').onclick = async () => {
         // 空闲超时：每个请求独立计时，且每次读到一个数据块就重新计时。
         // 于是镜像「挂住不动」超过 REQ_TIMEOUT_MS 必定响亮失败——不会不再出进度行、
         // 变成无法归因的停住；同时也不会误杀只是慢、但一直在出数据的镜像。
-        let tid;
+        let tid, wtid;
         const arm = () => { clearTimeout(tid); tid = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS); };
         try {
           arm();
@@ -189,11 +227,23 @@ document.getElementById('go').onclick = async () => {
               throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 流中断/超时（已读到 ${pos}）: ${e.name} ${e.message}`);
             }
             if (r.done) break;
+            // 写入期间停掉「镜像空闲超时」：否则一次超过 REQ_TIMEOUT_MS 的写入会 abort 控制器，
+            // 以「流中断/超时」出现在日志里，把写入停滞误标成镜像流超时——正是本任务最在意的归因噪声。
+            // 写入侧改用独立且标签明确的计时（写入停滞），写完后再重新 arm()，恢复空闲超时语义。
+            clearTimeout(tid);
             try {
-              await stream.write({ type: 'write', position: pos, data: r.value });
+              await Promise.race([
+                stream.write({ type: 'write', position: pos, data: r.value }),
+                new Promise((_, rej) => {
+                  wtid = setTimeout(() => rej(new Error(`写入停滞超过 ${REQ_TIMEOUT_MS / 1000}s`)), REQ_TIMEOUT_MS);
+                }),
+              ]);
             } catch (e) {
-              throw new Error(`[下载] 写入失败: 镜像 ${prefix} 区块 bytes=${start}-${end} 位置 ${pos}: ${e.name} ${e.message}`);
+              throw new Error(`[下载] 写入失败或停滞: 镜像 ${prefix} 区块 bytes=${start}-${end} 位置 ${pos}: ${e.name} ${e.message}`);
+            } finally {
+              clearTimeout(wtid);
             }
+            arm();   // 写入结束，恢复「镜像空闲超时」语义
             pos += r.value.length;
             done += r.value.length;
           }
@@ -205,6 +255,7 @@ document.getElementById('go').onclick = async () => {
           log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${fmtHeap(nowHeap)} peak=${fmtHeap(peakHeap)}`);
         } finally {
           clearTimeout(tid);
+          clearTimeout(wtid);
           inflight.delete(ac);
         }
       }
@@ -217,7 +268,13 @@ document.getElementById('go').onclick = async () => {
 
     // 采样必须一直覆盖到 close()：createWritable() 若在 close 时才真正落盘，
     // 真实峰值出现在关闭期间，提前 clearInterval 会把峰值读平 → 假 PASS。
-    await stream.close();
+    // close 阶段的失败（磁盘满时最常见的 flush 失败恰好发生在这里，也正是「关闭时才落盘」
+    // 的峰值所在）必须自带阶段标签，否则会以裸 DOMException 的形式出现在日志里，没有 [探针]/[下载] 前缀。
+    try {
+      await stream.close();
+    } catch (e) {
+      throw new Error(`[收尾] stream.close() 失败: ${e && e.name} ${e && e.message}`);
+    }
     sampleHeap();              // close 之后（可能的 flush 之后）再补一次读数
     clearInterval(heapTimer);  // 到这里才停采样，覆盖范围包含 close 完成之后
 
@@ -226,16 +283,23 @@ document.getElementById('go').onclick = async () => {
 
     // 自证大小：让「文件字节数正确」直接出现在日志里，不必人工去翻分块日志。
     // 只读 .size —— 这是 500MB 文件，禁止把响应体整块缓冲进内存（见 Global Constraints 热路径禁令）。
-    const written = (await handle.getFile()).size;
+    let written;
+    try {
+      written = (await handle.getFile()).size;
+    } catch (e) {
+      throw new Error(`[收尾] 大小校验读取失败: ${e && e.name} ${e && e.message}`);
+    }
     log(written === total
       ? `[大小校验] PASS: 落盘文件 ${written} 字节 === total ${total}`
       : `[大小校验] FAIL: 落盘文件 ${written} 字节 !== total ${total}`);
+    log('[大小校验] 注意: 本条只证明长度正确，不证明内容正确——长度正确但内容错位同样会 PASS。');
   } catch (e) {
     aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
     clearInterval(heapTimer);
     for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
     log(`失败: ${e && e.message}`);
+    logFailureAttribution(e && e.message);
   }
 };
 </script>
@@ -246,13 +310,17 @@ document.getElementById('go').onclick = async () => {
 > **为什么 `showSaveFilePicker` 必须排在所有 `await` 之前：** 它依赖用户手势的「瞬时激活」，
 > Chrome 里这个窗口约 5 秒。若先等镜像探测再调用，激活会过期并抛 `SecurityError`，
 > 表现为「点了没反应」——极易被误判成 FSA 不可行。**这是本 spike 最容易踩的假阴性，
-> 务必保持这个调用顺序**（特性预检 `typeof window.showSaveFilePicker !== 'function'` 排在它前面，
-> 但那只是属性读取，不消耗激活）。同理，探针与下载都包在 `try` 里，任何失败都会写进日志面板，
-> 不会出现「空白日志」这种无法归因的结果。
+> 务必保持这个调用顺序**（排在它前面的特性预检只是属性读取，不消耗激活）。预检本身按
+> Global Constraints 同时检查 `window.showSaveFilePicker` 与
+> `FileSystemFileHandle.prototype.createWritable`：只有选择器、没有 `createWritable` 的环境，
+> 会以一句点名真实缺失能力的消息退出，而不是被下面那句 SecurityError 的重试提示带进重试死循环。
+> 同理，探针与下载都包在 `try` 里，任何失败都会写进日志面板，不会出现「空白日志」这种无法归因的结果。
 >
-> **失败必须可归因：** 日志里每一条 `失败:` 都带 `[探针]` 或 `[下载]` 前缀，并附上具体的镜像 URL
-> 与字节区间。4 个异构镜像里某个退化（忽略 Range 回 200、中途断连、挂住）会因此与
-> 「并行定位写入不被支持」区分开——**判读结论前必须先看前缀**，否则会把一次镜像故障误判成架构不成立。
+> **失败必须可归因：** 日志里每一条 `失败:` 都带阶段标签（`[探针]` / `[下载]` / `[收尾]`），
+> 并附上具体的镜像 URL 与字节区间。4 个异构镜像里某个退化（忽略 Range 回 200、中途断连、挂住）
+> 会因此与「并行定位写入不被支持」区分开——**判读时按失败消息的文本判定，不按阶段前缀判定**
+> （`[下载]` 里同时装着写入问题和纯镜像请求失败，见 Step 3 的归因表），
+> 否则会把一次镜像故障误判成架构不成立。
 
 - [ ] **Step 2: 起本地服务器并打开**
 
@@ -272,6 +340,8 @@ cd "D:/github_download++/spike" && python -m http.server 8000
 计入，而 FSA 写入管线与网络缓冲都活在浏览器进程里，`performance.memory` 根本看不到它们。
 **所以这个数字无法排除「整个浏览器进程的内存随文件大小增长」**——它必须由人工用任务管理器交叉验证，
 否则「峰值堆两百 MiB」会被读成一个并不成立的结论。
+另外这个读数本身是粗粒度的：未以 `--enable-precise-memory-info` 启动时，Chrome 会对
+`performance.memory` 的取值分桶量化，只能当数量级看，不要拿它做精确对比。
 
 点击「开始」，选择保存位置，等待完成。记录以下数据：
 
@@ -281,52 +351,98 @@ cd "D:/github_download++/spike" && python -m http.server 8000
    必须改用 Chrome/Edge 重跑，不得据此判定通过。
 3. **本标签页内存的三个读数**（任务管理器）：下载**前** / 下载**中** / 下载**后**各一次。
    若读数随下载字节数持续攀升而不是在高位附近波动后回落，说明有整包累积，不通过。
-4. **`[大小校验]` 行**：页面在 `close()` 之后会打印 `PASS` 或 `FAIL`。出现 `FAIL` 即不通过，
-   不必再算哈希。
-5. **文件 SHA-256**
+4. **`[大小校验]` 行**：页面在 `close()` 之后会打印 `PASS` 或 `FAIL`。出现 `FAIL` 即不通过。
+   **`PASS` 只证明长度正确，不证明内容正确**——长度正确但内容错位（见 Step 5）同样会打印 `PASS`，
+   所以这一行既不能替代 SHA-256，也不是「过了就不用算哈希」的通行证。
+5. **文件 SHA-256**（参照文件由 Step 4 提供）
 
-算 SHA-256：
+算哈希与大小：
 
 ```bash
 certutil -hashfile "下载到的文件路径" SHA256
 ```
 
-**若失败，必须做并发归因，否则结论不可用。** 先看 `失败:` 行的前缀：`[探针]` 指镜像/网络问题
-（与 FSA 无关），`[下载]` 才是写入或区块校验问题。若前缀为 `[下载]` 且消息指向写入，把
-`spike/fsa-parallel.html` 顶部的 `const WORKERS = 4;` 改成 `1` 后原样重跑：
+**`certutil -hashfile` 不打印文件大小**，它只打印路径和哈希。要拿下载文件的确切字节数必须另取，
+不要从 `certutil` 的输出里找：
+
+```bash
+ls -l "下载到的文件路径"
+stat -c '%s' "下载到的文件路径"     # MSYS / Git Bash
+```
+
+**若失败，必须做并发归因，否则结论不可用。** 归因**按失败消息的文本判断，不按阶段前缀判断**——
+`[下载]` 里既有写入 / 区块完整性问题，也有纯镜像请求失败：
+
+| 失败消息里出现 | 含义 | 下一步 |
+| --- | --- | --- |
+| `期望 206` / `Content-Range` / `截断` / `写入失败` | 区块完整性或写入问题（与镜像无关） | 可做 `WORKERS=1` 归因（见下） |
+| `请求失败/超时` / `流中断/超时` | 该镜像的请求 / 流问题 | **换一个镜像**重跑，不要用 `WORKERS=1` |
+| `[探针]` | 镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西 | 换一个可用镜像重跑 |
+| `[收尾]` | `close()` / 读取落盘大小失败，常见于磁盘空间不足 | 确认目标盘空间后原样重跑 |
+
+**只有**失败消息指向写入或区块完整性时，才把 `spike/fsa-parallel.html` 顶部的
+`const WORKERS = 4;` 改成 `1` 后原样重跑：
 
 - `WORKERS=1` **成功** ⇒ 定位写入本身可行，问题只在「并发写未串行化」（spike 里每个 worker 各自
   `await stream.write()`，彼此并未串行）。按 Global Constraints 给 `sink.write()` 加写互斥即可救回架构，
   **这不算本任务不通过**。
 - `WORKERS=1` **仍失败** ⇒ 定位写入本身不被支持，架构不成立，本任务不通过。
 
+**若失败消息指向镜像请求 / 流问题，绝不要用 `WORKERS=1` 归因。** `WORKERS=1` 只使用 `MIRRORS[0]`，
+会把故障镜像静默丢掉，于是重跑可能「成功」——那只说明那个镜像坏，不说明并发有问题。
+这种情况的正确动作是换一个镜像重跑。
+
 两种结果都要写进结论，因为它决定后续任务的架构改法。
 
-- [ ] **Step 4: 校验正确性**
+- [ ] **Step 4: 校验正确性（强制，不可跳过）**
 
-预期总大小 `499558899` 字节。确认 `certutil` 输出的文件大小与之完全一致——这与页面日志里的
-`[大小校验] PASS`（`(await handle.getFile()).size === total`）是同一件事，两者不一致时以人工复核为准。
+预期总大小 `499558899` 字节。用上面的 `ls -l` / `stat` 拿到下载文件的确切字节数，确认与 `499558899`
+完全一致，并与页面日志里的 `[大小校验] PASS`（`(await handle.getFile()).size === total`）互相印证。
 
-再跑一次原始直链下载同一文件用于比对哈希（可选，若直连太慢可跳过，仅凭大小判断）。
-**参照文件不要放 `/tmp`**：它在 Windows 上不是 `certutil` 能解析的路径，落到 `%USERPROFILE%\Downloads`：
+**但大小一致不等于文件正确。** 本闸门最危险的假 PASS 形态是：流接受了定位写入，却按自己的内部偏移
+落盘而不是按 `position` 落盘——产出的文件**长度完全正确、内容整体错位**，而且下载速度照样很好
+（正是本任务想要的那种速度）。这种文件能通过任何大小检查，页面自己的 `[大小校验]` 也照样打印 `PASS`，
+而 `certutil -hashfile` 根本不打印大小。**只有 SHA-256 能抓到它。**
+
+因此必须取一份参照文件并**比对 SHA-256**，没有替代方案。参照副本**经镜像**获取——直连 0.06 MB/s
+太慢，镜像实测单连接 3.8 MB/s、并行 22+ MB/s，所以「直连太慢」不再构成跳过哈希的理由：
 
 ```bash
-curl -skL -o "$USERPROFILE/Downloads/ref.exe" "https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe" --max-time 300
+curl -L -o "$USERPROFILE/Downloads/ref.exe" "https://gh.xmly.dev/https://github.com/babalae/better-genshin-impact/releases/download/0.65.0/BetterGI.Install.0.65.0.exe"
 certutil -hashfile "$USERPROFILE/Downloads/ref.exe" SHA256
+certutil -hashfile "下载到的文件路径" SHA256
 ```
 
-两次 SHA-256 必须一致。
+- **参照文件不要放 `/tmp`**：它在 Windows 上不是 `certutil` 能解析的路径，落到 `%USERPROFILE%\Downloads`。
+- `curl` 对这些镜像可用：这 4 个镜像不在 Watt Toolkit 的 hosts 拦截列表里，curl 自带 CA 包即可。
+- 如果镜像路径拿到的参照本身可疑（例如下载过程报错），换另一个镜像重取，**不得**因此降级成只比大小。
+- 两份 `certutil` 输出的哈希必须逐字相同。**不一致即本任务不通过**，不存在「大小对得上就放过」。
+
+**长度正确但内容错位是本闸门最危险的假 PASS 形态，SHA-256 是唯一能抓到它的检查。**
 
 - [ ] **Step 5: 判定并提交结论**
 
-**通过条件（全部满足）**：
-- SHA-256 与参照一致，或文件大小精确等于 `499558899`（且日志中 `[大小校验]` 为 `PASS`）
-- 速度显著优于 0.06 MB/s 的直连基线（预期 > 3 MB/s）
-- 峰值堆稳定在几百 MiB 以内，不随下载字节数线性增长（若 `peak=N/A`，本条由任务管理器三读数代替判定）
-- 任务管理器里本标签页内存的三个读数不随下载字节数持续攀升
+**通过条件（全部满足，缺一不可）：**
 
-**若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**：架构判定为**通过**，但 Task 2 之后的
-`sink.write()` 必须实现串行化（Global Constraints 已要求），计划按此继续。
+1. **SHA-256 必须与参照完全一致（强制，不可跳过，不接受任何替代）。**
+   参照按 Step 4 经镜像获取，两份 `certutil -hashfile … SHA256` 输出逐字相同。
+   **文件大小一致不能作为正确性的证据**：长度正确但内容错位的文件能通过任何大小检查，
+   包括页面自己的 `[大小校验] PASS`（它比较的只是页面自己数出来的字节数，是循环论证），
+   而 `certutil -hashfile` 压根不打印文件大小。唯一能证明内容正确的检查是 SHA-256。
+2. **速度显著优于 0.06 MB/s 的直连基线**（预期 > 3 MB/s）。
+3. **内存不随下载字节数线性增长**，以下两条证据都要：
+   - JS 堆峰值稳定在几百 MiB 以内，且不随下载字节数线性增长；
+   - Chrome 任务管理器（`Shift+Esc`）在下载**前 / 中 / 后**三次记录的**本标签页内存**不随下载字节数
+     线性增长。
+
+   若页面显示 `heap=N/A`，说明该环境没有 `performance.memory`——此时**以任务管理器读数为唯一依据**，
+   并须改用 Chrome / Edge 重跑；不得把 `N/A` 读成「内存优秀」。
+
+**本闸门在防什么：** 长度正确但内容错位是本闸门最危险的假 PASS 形态，SHA-256 是唯一能抓到它的检查。
+
+**若在 `WORKERS=4` 失败但 `WORKERS=1` 成功**（且失败消息确实指向写入 / 区块完整性，见 Step 3 归因表）：
+架构判定为**通过**，但 Task 2 之后的 `sink.write()` 必须实现串行化（Global Constraints 已要求），
+计划按此继续。
 
 **不通过** → 停止，回报用户，改走 IndexedDB 拼装或顺序写入方案，本计划需重写。
 

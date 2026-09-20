@@ -17,6 +17,34 @@ const HAS_MEM = typeof performance !== 'undefined' && !!performance.memory;
 // 无 performance.memory 时一律打印 N/A。打印 0MiB 会被读成「内存极好」——那是假 PASS。
 const fmtHeap = (bytes) => HAS_MEM ? `${(bytes / 1048576).toFixed(0)}MiB` : 'N/A';
 
+// 归因只看失败消息的文本，不看阶段前缀：[下载] 里同时装着「写入 / 区块完整性」与
+// 「纯镜像请求失败」两类，按前缀判断会把一次镜像退化误判成架构不成立。
+// 注意顺序：[探针] 分支必须最先判——探针的 Content-Range 失配消息里也带着 "Content-Range"，
+// 否则会被下面的写入类正则捞走，把「镜像不遵守 Range」误导成「并发写有问题」。
+const PROBE_FAIL_RE = /\[探针\]/;
+const FINALIZE_FAIL_RE = /\[收尾\]/;
+const WRITE_FAIL_RE = /写入失败|期望 206|Content-Range|截断/;
+const MIRROR_FAIL_RE = /请求失败\/超时|流中断\/超时/;
+function logFailureAttribution(msg) {
+  const m = String(msg == null ? '' : msg);
+  if (PROBE_FAIL_RE.test(m)) {
+    log('[并发归因] 失败在探针阶段 —— 这是镜像 / 网络问题，与 FSA 无关，本轮没有验证任何东西。');
+    log('[并发归因] 换一个可用镜像重跑；不要用 WORKERS=1 归因（它换的是并发度，换不掉一个坏镜像）。');
+  } else if (FINALIZE_FAIL_RE.test(m)) {
+    log('[并发归因] 失败发生在收尾（close / 读取落盘文件大小），不是镜像问题；常见原因是磁盘空间不足或落盘失败。');
+    log('[并发归因] 先确认目标盘剩余空间后原样重跑；不要用 WORKERS=1 归因——它改的是并发，与收尾无关。');
+  } else if (WRITE_FAIL_RE.test(m)) {
+    log(`[并发归因] 失败消息指向写入 / 区块完整性 ⇒ 把脚本顶部的 WORKERS 改成 1 后原样重跑（其余步骤不变）：`);
+    log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
+    log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+  } else if (MIRROR_FAIL_RE.test(m)) {
+    log('[并发归因] 失败消息指向某个镜像的请求 / 流问题，与写入无关 ⇒ 该镜像可疑，请换用另一个镜像重跑。');
+    log('[并发归因] 此时不要改成 WORKERS=1：WORKERS=1 只用 MIRRORS[0]，会静默丢掉故障镜像而「成功」，把镜像退化误读成并发问题。');
+  } else {
+    log('[并发归因] 失败消息既不像写入问题、也不像镜像请求问题 ⇒ 不得用 WORKERS=1 捷径下结论，先单独复现并记下完整消息。');
+  }
+}
+
 document.getElementById('go').onclick = async () => {
   // 先在运行最开始、无条件地交代度量口径与归因方法，
   // 这样无论后面是成功还是失败，读日志的人都知道该怎么读这些数字。
@@ -26,11 +54,13 @@ document.getElementById('go').onclick = async () => {
   log('[MEMORY] 下面的 heap/peak 只是渲染进程 V8 JS 堆的读数：TypedArray/ArrayBuffer 后备存储至多被部分计入，');
   log('[MEMORY] 而 FSA 写入管线与网络缓冲都活在浏览器进程里，performance.memory 完全看不到它们。');
   log('[MEMORY] 因此这个数字无法排除「整个浏览器进程的内存随文件大小增长」。');
+  log('[MEMORY] 另外这些读数本身还是粗粒度的：未以 --enable-precise-memory-info 启动时 Chrome 会对该值分桶量化，只可当数量级看。');
   log('[MEMORY] 人工必须另开 Chrome 任务管理器（Shift+Esc），在下载前 / 下载中 / 下载后各记录一次本标签页内存，三项都写进结论。');
   if (!HAS_MEM) log('[MEMORY] 本环境没有 performance.memory：本次 heap=N/A peak=N/A —— 这是「测不到」，不是「内存优秀」。须用 Chrome/Edge 重跑。');
-  log(`[并发归因] 若本次以 WORKERS=${WORKERS} 失败，请把脚本顶部的 WORKERS 改成 1 后重跑（其余步骤不变）：`);
-  log('[并发归因] WORKERS=1 成功 ⇒ 定位写入本身可行，问题只在「并发写未串行化」（加写互斥即可救回架构）；');
-  log('[并发归因] WORKERS=1 仍失败 ⇒ 定位写入本身不被支持，架构不成立。');
+  // 并发归因只在失败时、且按失败消息的文本给出（见 logFailureAttribution）。
+  // 在这里先交代判读口径，避免事后读日志的人不知道该怎么归因。
+  log('[并发归因] 若失败，归因只看失败消息的文本，不看阶段前缀：[探针] ⇒ 镜像 / 网络问题，本轮无效；[收尾] ⇒ close / 落盘问题；');
+  log('[并发归因] 含「写入失败 / 期望 206 / Content-Range / 截断」⇒ 区块完整性或写入问题（可做 WORKERS=1 归因）；含「请求失败/超时 / 流中断/超时」⇒ 该镜像的请求 / 流问题，换一个镜像重跑，不要用 WORKERS=1 捷径。');
 
   // 特性预检：非 Chromium / 非安全上下文时应报「环境不支持」，
   // 而不是抛 TypeError 之后再补一句 SecurityError 的提示，把不支持的环境带进重试死循环。
@@ -39,11 +69,19 @@ document.getElementById('go').onclick = async () => {
     log('本 spike 需要 Chromium 内核浏览器（Chrome / Edge），且页面必须经 http://localhost 提供；file:// 不是可靠的安全上下文，Firefox / Safari 也不支持该 API。');
     return;
   }
+  // 能力检测必须检测 createWritable，而不是只看 showSaveFilePicker：
+  // 有选择器、但没有 createWritable 的环境会在下面「若为 SecurityError …
+  // 重新点一次即可」那句提示里被带进重试死循环——真正缺失的能力与用户激活无关。
+  if (typeof FileSystemFileHandle === 'undefined' || typeof FileSystemFileHandle.prototype.createWritable !== 'function') {
+    log('无法创建文件: 本环境有 window.showSaveFilePicker，但 FileSystemFileHandle.prototype.createWritable 不可用。');
+    log('本 spike 的定位写入依赖 createWritable() 返回的 FileSystemWritableFileStream；只有保存选择器不构成所需能力，重试点击不会改变结果。');
+    return;
+  }
 
   // showSaveFilePicker 依赖用户手势的瞬时激活（Chrome 约 5 秒），
   // 因此它必须排在所有 await 之前。若先等镜像探测再调用，激活会过期并抛
   // SecurityError，表现为「点了没反应」——极易被误判成 FSA 不可行。
-  // 这是本 spike 唯一的假阴性来源。
+  // 这是本 spike 最容易踩的假阴性来源。
   let handle;
   let stream;
   let heapTimer;            // 声明在 try 之外，catch 里才能 clearInterval
@@ -109,7 +147,7 @@ document.getElementById('go').onclick = async () => {
         // 空闲超时：每个请求独立计时，且每次读到一个数据块就重新计时。
         // 于是镜像「挂住不动」超过 REQ_TIMEOUT_MS 必定响亮失败——不会不再出进度行、
         // 变成无法归因的停住；同时也不会误杀只是慢、但一直在出数据的镜像。
-        let tid;
+        let tid, wtid;
         const arm = () => { clearTimeout(tid); tid = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS); };
         try {
           arm();
@@ -143,11 +181,23 @@ document.getElementById('go').onclick = async () => {
               throw new Error(`[下载] 镜像 ${prefix} 区块 bytes=${start}-${end} 流中断/超时（已读到 ${pos}）: ${e.name} ${e.message}`);
             }
             if (r.done) break;
+            // 写入期间停掉「镜像空闲超时」：否则一次超过 REQ_TIMEOUT_MS 的写入会 abort 控制器，
+            // 以「流中断/超时」出现在日志里，把写入停滞误标成镜像流超时——正是本任务最在意的归因噪声。
+            // 写入侧改用独立且标签明确的计时（写入停滞），写完后再重新 arm()，恢复空闲超时语义。
+            clearTimeout(tid);
             try {
-              await stream.write({ type: 'write', position: pos, data: r.value });
+              await Promise.race([
+                stream.write({ type: 'write', position: pos, data: r.value }),
+                new Promise((_, rej) => {
+                  wtid = setTimeout(() => rej(new Error(`写入停滞超过 ${REQ_TIMEOUT_MS / 1000}s`)), REQ_TIMEOUT_MS);
+                }),
+              ]);
             } catch (e) {
-              throw new Error(`[下载] 写入失败: 镜像 ${prefix} 区块 bytes=${start}-${end} 位置 ${pos}: ${e.name} ${e.message}`);
+              throw new Error(`[下载] 写入失败或停滞: 镜像 ${prefix} 区块 bytes=${start}-${end} 位置 ${pos}: ${e.name} ${e.message}`);
+            } finally {
+              clearTimeout(wtid);
             }
+            arm();   // 写入结束，恢复「镜像空闲超时」语义
             pos += r.value.length;
             done += r.value.length;
           }
@@ -159,6 +209,7 @@ document.getElementById('go').onclick = async () => {
           log(`${done} / ${total}  ${(done / 1048576 / secs).toFixed(2)} MiB/s  heap=${fmtHeap(nowHeap)} peak=${fmtHeap(peakHeap)}`);
         } finally {
           clearTimeout(tid);
+          clearTimeout(wtid);
           inflight.delete(ac);
         }
       }
@@ -171,7 +222,13 @@ document.getElementById('go').onclick = async () => {
 
     // 采样必须一直覆盖到 close()：createWritable() 若在 close 时才真正落盘，
     // 真实峰值出现在关闭期间，提前 clearInterval 会把峰值读平 → 假 PASS。
-    await stream.close();
+    // close 阶段的失败（磁盘满时最常见的 flush 失败恰好发生在这里，也正是「关闭时才落盘」
+    // 的峰值所在）必须自带阶段标签，否则会以裸 DOMException 的形式出现在日志里，没有 [探针]/[下载] 前缀。
+    try {
+      await stream.close();
+    } catch (e) {
+      throw new Error(`[收尾] stream.close() 失败: ${e && e.name} ${e && e.message}`);
+    }
     sampleHeap();              // close 之后（可能的 flush 之后）再补一次读数
     clearInterval(heapTimer);  // 到这里才停采样，覆盖范围包含 close 完成之后
 
@@ -180,16 +237,23 @@ document.getElementById('go').onclick = async () => {
 
     // 自证大小：让「文件字节数正确」直接出现在日志里，不必人工去翻分块日志。
     // 只读 .size —— 这是 500MB 文件，禁止把响应体整块缓冲进内存（见 Global Constraints 热路径禁令）。
-    const written = (await handle.getFile()).size;
+    let written;
+    try {
+      written = (await handle.getFile()).size;
+    } catch (e) {
+      throw new Error(`[收尾] 大小校验读取失败: ${e && e.name} ${e && e.message}`);
+    }
     log(written === total
       ? `[大小校验] PASS: 落盘文件 ${written} 字节 === total ${total}`
       : `[大小校验] FAIL: 落盘文件 ${written} 字节 !== total ${total}`);
+    log('[大小校验] 注意: 本条只证明长度正确，不证明内容正确——长度正确但内容错位同样会 PASS。');
   } catch (e) {
     aborted = true;                        // 先置位，其余 worker 立即停止发起新请求
     clearInterval(heapTimer);
     for (const ac of inflight) { try { ac.abort(); } catch {} }
     try { await stream.abort(); } catch {}
     log(`失败: ${e && e.message}`);
+    logFailureAttribution(e && e.message);
   }
 };
 </script>
